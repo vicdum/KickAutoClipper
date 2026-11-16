@@ -25,7 +25,10 @@ DEFAULT_MODEL = "large-v3"
 # Whisper'ın sessizlik/müzik üzerinde sık uydurduğu kalıplar (özellikle Türkçe altyazı veri setlerinden).
 _HALLUCINATIONS = re.compile(
     r"altyaz[ıi]\s*m\.?\s*k\.?|abone\s+ol|izlediğiniz\s+için\s+teşekkür|"
-    r"thanks?\s+for\s+watching|subtitles?\s+by|amara\.org|altyazı\s+çeviri",
+    r"thanks?\s+for\s+watching|subtitles?\s+by|amara\.org|altyazı\s+çeviri|"
+    r"редактор\s+субтитров|корректор\s+а\.|субтитры\s+(сделал|подготовил)|"
+    # Konuşma değil, ses etiketi: segmentin tamamı "Müzik", "[Alkış]", "(Gülüşmeler)" vb. ise.
+    r"^\W*(m[üu]zik|music|alk[ıi][şs]|applause|g[üu]l[üu][şs]meler|kahkaha|laughter)\W*$",
     re.IGNORECASE,
 )
 
@@ -36,6 +39,7 @@ class Word:
     end: float
     text: str
     sentence_end: bool = False  # Whisper segmentinin son kelimesi (noktalama olmasa da cümle sınırı)
+    lang: str | None = None  # kelimenin dili (segmentten); büyük harf kuralı için
 
 
 @dataclass
@@ -102,16 +106,22 @@ class Transcriber:
         start: float = 0.0,
         duration: float | None = None,
         context: float = 15.0,
+        multilingual: bool = True,
     ) -> list[Word]:
-        return self._transcribe(media, language, start, duration, context)[0]
+        return self._transcribe(media, language, start, duration, context, multilingual)[0]
 
-    def _transcribe(self, media, language, start, duration, context):
+    def _transcribe(self, media, language, start, duration, context, multilingual=True):
         """`media` dosyasının [start, start+duration] aralığını yazıya döker; (kelimeler, ses, bağlam süresi)
         döner, zamanlar `start`'a göredir.
 
         - `context`: aralıktan önceki bu kadar saniye de modele verilir. Klip bir cümlenin
           ortasında başlayabildiği için bağlam tanıma doğruluğunu belirgin artırır; bu
           bölümdeki kelimeler sonuçtan çıkarılır.
+        - `multilingual`: dil her segment için ayrı tespit edilir. Yayıncılar yabancı videolara
+          tepki verirken dil sabitse Whisper İngilizce konuşmayı bozuk Türkçeye çevirip ("Melting
+          pot, bam" -> "Yüzüm memnun, bim") tekrar döngülerine giriyordu. Yayın dili ve İngilizce
+          dışında bir yazı sistemi (ör. Kiril) çıkan segmentler yayın dilinde yeniden yazıya dökülür:
+          kısa gürültülü Türkçe bölümler zaman zaman Rusça sanılıp uydurma metin üretiyordu.
         """
         ctx_start = max(0.0, start - context)
         pre = start - ctx_start
@@ -121,15 +131,12 @@ class Transcriber:
             # aynı ses her çalıştırmada farklı metin üretebilir.
             import ctranslate2
 
-            ctranslate2.set_random_seed(0)
-            result, _ = self.model.transcribe(
-                audio,
-                language=language,
+            opts = dict(
+                language=None if multilingual else language,
+                multilingual=multilingual,
                 # Kelime zamanları altyazı senkronu için kullanılır; ayrıca Whisper bir sonraki
                 # 30 sn'lik pencereye nereden devam edeceğini bunlarla belirler.
                 word_timestamps=True,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
                 condition_on_previous_text=False,  # tekrar döngülerini ve uydurmaları azaltır
                 # Sessizlik tespiti yalnızca VAD ile yapılır. Whisper'ın kendi "konuşma yok" kararı
                 # (no_speech_prob > 0.6 ve düşük güven) gürültülü ortamda konuşma olan 30 sn'lik
@@ -139,15 +146,51 @@ class Transcriber:
                 no_speech_threshold=None,
                 beam_size=5,
             )
-            segments = [_merge_pieces(s) for s in result if not _HALLUCINATIONS.search(s.text)]
+            ctranslate2.set_random_seed(0)
+            result, info = self.model.transcribe(
+                audio, vad_filter=True, vad_parameters={"min_silence_duration_ms": 500}, **opts
+            )
+            # VAD (Silero) arka planda şarkı/müzik varken konuşmayı da "sessizlik" sayabiliyor: bir
+            # klipte 59 sn'nin tamamı atıldı, oysa yayıncı konuşuyordu. Normal kliplerde VAD sesin
+            # %60-90'ını bırakıyor; çok azını bıraktıysa klip VAD'sız yeniden yazıya dökülür
+            # (uydurmalar bilinen kalıp filtresiyle elenir).
+            if info.duration and info.duration_after_vad / info.duration < MIN_VAD_KEEP:
+                ctranslate2.set_random_seed(0)
+                result, _ = self.model.transcribe(audio, vad_filter=False, **opts)
+            segments = []
+            for seg in result:
+                if _HALLUCINATIONS.search(seg.text):
+                    continue
+                if multilingual and language and not _latin(seg.text):
+                    segments.extend(self._redo_segment(audio, seg, language, opts))
+                else:
+                    segments.append(_merge_pieces(seg))
         segments = [s for s in segments if s[2]]
 
         words = []
         for _, _, ws in segments:
+            lang = "en" if looks_english(" ".join(w[2] for w in ws)) else language
             for k, (a, b, text) in enumerate(ws):
                 if b - pre > 0.05:  # bağlam bölümündeki kelimeleri at
-                    words.append(Word(round(max(a - pre, 0.0), 3), round(b - pre, 3), text, k == len(ws) - 1))
+                    words.append(Word(round(max(a - pre, 0.0), 3), round(b - pre, 3), text, k == len(ws) - 1, lang))
         return fix_long_words(words), audio, pre
+
+    def _redo_segment(self, audio, seg, language, opts):
+        """Segmentin ses aralığını yayın dilinde yeniden yazıya döker (kilit çağıran tarafta)."""
+        lo, hi = max(0, int((seg.start - 0.2) * 16000)), min(len(audio), int((seg.end + 0.2) * 16000))
+        if hi - lo < 3200:
+            return []
+        redo, _ = self.model.transcribe(
+            audio[lo:hi], vad_filter=False, **{**opts, "language": language, "multilingual": False}
+        )
+        off = lo / 16000
+        out = []
+        for s in redo:
+            if _HALLUCINATIONS.search(s.text) or not _latin(s.text):
+                continue
+            s0, s1, ws = _merge_pieces(s)
+            out.append((s0 + off, s1 + off, [(a + off, b + off, t) for a, b, t in ws]))
+        return out
 
     def cues(
         self,
@@ -157,10 +200,11 @@ class Transcriber:
         duration: float | None = None,
         context: float = 15.0,
         refine: bool = False,
+        multilingual: bool = True,
     ) -> list[Cue]:
         """Yazıya döküp altyazı satırlarına böler. `refine`: kayan satırları tekrar dinleyerek
         düzeltir (bağımsız ölçümde kayan satır oranı %8 -> %6, ancak ~4-5 kat yavaş)."""
-        words, audio, pre = self._transcribe(media, language, start, duration, context)
+        words, audio, pre = self._transcribe(media, language, start, duration, context, multilingual)
         cues = build_cues(words)
         if refine and cues:
             cues = self.refine_timing(audio, pre, cues, language)
@@ -203,6 +247,26 @@ class Transcriber:
         return no_overlap(out)
 
 
+_NON_LATIN = re.compile(r"[^\W\d_a-zA-ZçğıöşüÇĞİÖŞÜâîûÂÎÛäëéèêàáíìóòúùñÄËÉÈÊÀÁÍÌÓÒÚÙÑß]")
+_EN_WORDS = {"the", "you", "i", "a", "is", "to", "and", "it", "that", "of", "what", "this", "in", "me",
+             "my", "we", "do", "don't", "i'm", "it's", "be", "have", "just", "not", "are", "was", "so",
+             "with", "for", "on", "your", "all", "okay", "oh", "yeah", "no", "like", "get", "can", "know"}
+
+
+def _latin(text: str) -> bool:
+    """Metin yalnızca Latin harfleri (Türkçe ve yaygın Avrupa harfleri dahil) içeriyor mu?"""
+    return not _NON_LATIN.search(text)
+
+
+def looks_english(text: str) -> bool:
+    """Kaba İngilizce tespiti: Türkçe'ye özgü harf yok ve kelimelerin en az %25'i yaygın İngilizce kelime."""
+    if re.search(r"[çğışöüÇĞİŞÖÜ]", text):
+        return False
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    return bool(words) and sum(w in _EN_WORDS for w in words) / len(words) >= 0.25
+
+
+MIN_VAD_KEEP = 0.3  # VAD sesin bundan azını konuşma sayarsa VAD'sız yeniden dene
 REFINE_WEAK = 0.5  # bu benzerliğin altındaki satırlar için kayma aranır
 REFINE_ACCEPT = 0.6  # kaydırılmış konumda en az bu benzerlik gerekir
 REFINE_GAIN = 0.3  # ve mevcut konumdan en az bu kadar iyi olmalı
@@ -227,7 +291,7 @@ def normalize_words(text: str) -> list[str]:
 
 def shift_cue(c: Cue, d: float) -> Cue:
     return Cue(max(c.start + d, 0.0), c.end + d,
-               [Word(max(w.start + d, 0.0), w.end + d, w.text, w.sentence_end) for w in c.words])
+               [Word(max(w.start + d, 0.0), w.end + d, w.text, w.sentence_end, w.lang) for w in c.words])
 
 
 def no_overlap(cues: list[Cue]) -> list[Cue]:
@@ -264,9 +328,9 @@ def fix_long_words(words: list[Word], tolerance: float = 1.0) -> list[Word]:
         limit = natural_duration(w.text)
         if w.end - w.start > max(limit, tolerance):
             if first:
-                w = Word(w.start, round(w.start + limit, 3), w.text, w.sentence_end)
+                w = Word(w.start, round(w.start + limit, 3), w.text, w.sentence_end, w.lang)
             else:
-                w = Word(round(w.end - limit, 3), w.end, w.text, w.sentence_end)
+                w = Word(round(w.end - limit, 3), w.end, w.text, w.sentence_end, w.lang)
         out.append(w)
         first = w.sentence_end
     return out
@@ -360,7 +424,7 @@ def shift(cues: list[Cue], seconds: float) -> list[Cue]:
         return cues
     return [
         Cue(c.start + seconds, c.end + seconds,
-            [Word(w.start + seconds, w.end + seconds, w.text, w.sentence_end) for w in c.words])
+            [Word(w.start + seconds, w.end + seconds, w.text, w.sentence_end, w.lang) for w in c.words])
         for c in cues
     ]
 
@@ -426,7 +490,7 @@ def to_ass(
     on, off = tag(style.highlight), tag(style.primary)
     lines = []
     for c in cues:
-        texts = [_ass_escape(upper(w.text, language) if style.uppercase else w.text) for w in c.words]
+        texts = [_ass_escape(upper(w.text, w.lang or language) if style.uppercase else w.text) for w in c.words]
         # Parçadaki her kelime konuşulurken ayrı bir olay: o kelime vurgulu, diğerleri beyaz.
         for i, w in enumerate(c.words):
             start = c.start if i == 0 else w.start

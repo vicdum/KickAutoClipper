@@ -1,6 +1,8 @@
 import unittest
 
-from kick_auto_clipper.subtitles import _HALLUCINATIONS, Word, build_cues, shift, to_ass, to_srt, upper
+from kick_auto_clipper.subtitles import (
+    _HALLUCINATIONS, Word, _latin, build_cues, looks_english, shift, to_ass, to_srt, upper,
+)
 
 
 def words(*items):
@@ -48,10 +50,31 @@ class SubtitlesTest(unittest.TestCase):
         cue = shift(build_cues(words((1, 2, "a"))), 0.5)[0]
         self.assertEqual((cue.start, cue.end, cue.words[0].start), (1.5, 2.5, 1.5))
 
+    def test_language_helpers(self):
+        self.assertTrue(_latin("Şuraya dokun, abi!"))
+        self.assertTrue(_latin("Let's get real. Café"))
+        self.assertFalse(_latin("Редактор субтитров А.Семкин"))
+        self.assertTrue(looks_english("I just had the longest meeting."))
+        self.assertTrue(looks_english("Oh, man, am I a woman?"))
+        self.assertFalse(looks_english("Sütü karıştır, Pam."))
+        self.assertFalse(looks_english("Bunlar 10 yıl önce abi"))
+        self.assertFalse(looks_english("Kelly!"))  # yaygın İngilizce kelime yok -> yayın dili
+
+    def test_ass_uppercase_follows_word_language(self):
+        cues = build_cues([Word(0, 0.5, "this", lang="en"), Word(0.5, 1.0, "bitti", lang="tr")])
+        ass = to_ass(cues, 1080, 1920, language="tr")
+        self.assertIn("THIS", ass)  # İngilizce: i -> I
+        self.assertIn("BİTTİ", ass)  # Türkçe: i -> İ
+
     def test_hallucination_filter(self):
-        for t in ("Altyazı M.K.", "Abone olmayı unutmayın", "İzlediğiniz için teşekkürler"):
+        for t in ("Altyazı M.K.", "Abone olmayı unutmayın", "İzlediğiniz için teşekkürler",
+                  "Редактор субтитров А.Семкин Корректор А.Егорова"):
             self.assertTrue(_HALLUCINATIONS.search(t), t)
         self.assertIsNone(_HALLUCINATIONS.search("Bedava verdik mi?"))
+        # Ses etiketleri yalnızca segmentin tamamıysa elenir; cümle içinde geçen kelime kalır.
+        for t in (" Müzik", "[Müzik]", "(Alkış)", "Gülüşmeler.", "♪ Music ♪"):
+            self.assertTrue(_HALLUCINATIONS.search(t.strip()), t)
+        self.assertIsNone(_HALLUCINATIONS.search("Bu müzik çok güzel"))
 
 
 if __name__ == "__main__":

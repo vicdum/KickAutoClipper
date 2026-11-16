@@ -151,7 +151,8 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
             if transcriber:
                 # Ses, kesilecek aralığın aynısından okunur; zamanlar c.start'a göredir.
                 cues = transcriber.cues(src.path, job.vod.language, src.offset(c.start), c.duration,
-                                       context=CONTEXT, refine=args.refine_timing)
+                                       context=CONTEXT, refine=args.refine_timing,
+                                       multilingual=not args.single_language)
                 if fmt.layout != "original" and cues:
                     ass = f"{name}.ass"
                     (clip_dir / ass).write_text(to_ass(cues, fmt.width, fmt.height, language=job.vod.language), encoding="utf-8")
@@ -247,6 +248,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--encoder", choices=ENCODERS,
                    help="Video kodlayıcı: auto (NVIDIA GPU varsa onu kullanır), nvenc, cpu. Varsayılan: KAC_ENCODER veya auto")
     r.add_argument("--no-subtitles", dest="subtitles", action="store_false", help="Altyazı üretme")
+    r.add_argument("--single-language", action="store_true",
+                   help="Altyazıyı tamamen yayın dilinde üret (varsayılan: dil segment başına tespit edilir; "
+                        "yabancı videolar orijinal dilinde yazılır)")
     r.add_argument("--refine-timing", action="store_true",
                    help="Kayan altyazı satırlarını tekrar dinleyerek düzelt (daha doğru senkron, ~4-5 kat yavaş altyazı)")
     r.add_argument("--no-voice-boost", dest="voice_boost", action="store_false",

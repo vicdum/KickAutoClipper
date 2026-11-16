@@ -200,6 +200,7 @@ def cut(
     out_path: Path,
     ffmpeg: str = "ffmpeg",
     encode_args: list[str] | None = None,
+    extra_inputs: list[Path] | None = None,
 ) -> float:
     """`src` içinden [start, end) aralığını (video saniyesi) MP4 olarak kaydeder, klibin gerçek başlangıcını döner.
 
@@ -219,6 +220,7 @@ def cut(
         [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-ss", f"{offset:.3f}", "-i", str(src.path.resolve()),
+            *[arg for p in extra_inputs or [] for arg in ("-i", str(p.resolve()))],
             "-t", f"{end - actual_start:.3f}",
             *encode_args,
             out_path.name,

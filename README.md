@@ -17,9 +17,11 @@ Gereksinimler: Python 3.10+, [FFmpeg](https://ffmpeg.org/) (PATH'te olmalı; Win
 python -m venv .venv
 .venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
 pip install -e ".[gpu]"      # NVIDIA GPU yoksa: pip install -e .
+# Kelime hizalama ve konuşma güçlendirme için PyTorch (NVIDIA GPU, CUDA 12.8):
+pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-`[gpu]` eki altyazı üretimi için CUDA kütüphanelerini (cuBLAS, cuDNN) kurar. Altyazı modeli (~1,6 GB) ilk çalıştırmada bir kez indirilir.
+`[gpu]` eki altyazı üretimi için CUDA kütüphanelerini (cuBLAS, cuDNN) kurar. PyTorch kurulu değilse altyazılar yine üretilir, ancak kelime zamanları hizalanmaz ve konuşma güçlendirme atlanır. GPU olmayan makinede PyTorch'un CPU sürümü kurulabilir (`pip install torch torchaudio`). İlk çalıştırmada modeller bir kez indirilir: Whisper large-v3 (~3 GB), hizalama (~1,2 GB), vokal ayrıştırma (~320 MB).
 
 ## Kullanım
 
@@ -47,11 +49,19 @@ kac run https://kick.com/<kanal>/videos/<uuid>
 
 ### Altyazı
 
-- **Konuşma tanıma:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper), varsayılan model `large-v3-turbo`, dil VOD bilgisinden (ör. `tr`). NVIDIA GPU varsa CUDA (float16), yoksa CPU (int8) kullanılır.
+- **Konuşma tanıma:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper), varsayılan model `large-v3`, dil VOD bilgisinden (ör. `tr`). NVIDIA GPU varsa CUDA (float16), yoksa CPU (int8) kullanılır. Türkçede `large-v3`, `large-v3-turbo`'dan belirgin daha doğru; turbo'da tekrar döngüleri ve uydurma cümleler görüldü.
+- **Bağlam:** Klipten önceki 15 sn de modele verilir (sonuçtan çıkarılır). Klip çoğu zaman bir cümlenin ortasında başladığı için bu, karşılaştırmada en büyük doğruluk artışını sağladı (medyan kelime güveni 0,79 → 0,91).
+- **Zaman hizalama:** Whisper'ın kelime zaman damgaları gürültülü seste 1-2 sn (yer yer daha fazla) kayıyor. Tanınan metin, her Whisper segmentinin kendi penceresinde [MMS](https://pytorch.org/audio/stable/pipelines.html#id60) zorlamalı hizalama modeliyle (torchaudio `MMS_FA`) sese yeniden hizalanır; zamanlar sıralı tutulur. Doğrulama: altyazı yapay olarak ±0,5–1,5 sn kaydırıldığında konuşma başlangıçlarıyla uyum her klipte düşüyor, en iyi uyum 0 kaymada.
 - **Görünüm:** Kısa video stili; en fazla 3 kelime / 22 karakterlik parçalar, büyük kalın beyaz yazı, siyah kenar çizgisi, konuşulan kelime sarı. Yazı, `blur` yerleşiminde görüntünün hemen altındaki bulanık alanda durur. Türkçe büyük harf kuralı (i → İ) uygulanır.
-- **Doğruluk önlemleri:** Ses etkinliği algılama (VAD) ile sessiz bölümler atlanır, önceki metne koşullama kapalıdır (tekrar döngülerini önler), Whisper'ın sessizlikte uydurduğu bilinen kalıplar ("Altyazı M.K.", "abone olmayı unutmayın"…) elenir, parçalı gelen kelimeler birleştirilir ("Enes" + "'in").
+- **Doğruluk önlemleri:** Sessizlik yalnızca ses etkinliği algılama (VAD) ile belirlenir; Whisper'ın kendi "konuşma yok" kararı kapalıdır, çünkü gürültülü ortamda konuşma olan 30 sn'lik pencerenin tamamını atabiliyor. Önceki metne koşullama kapalıdır (tekrar döngülerini önler). Whisper'ın sessizlikte uydurduğu bilinen kalıplar ("Altyazı M.K.", "abone olmayı unutmayın"…) elenir, parçalı gelen kelimeler birleştirilir ("Enes" + "'in"), noktalama olmasa da cümle sınırında yeni satıra geçilir. Rastgele tohum sabittir.
+- **Denenip vazgeçilenler:** Sohbet/başlık kelimeleriyle ipucu (doğruluğu düşürdü, ipucu kelimeleri metne sızdı), ses filtresi (bağlamla birlikte fark yaratmadı), vokal ayrıştırılmış seste tanıma (güven düştü, uydurma arttı), toplu (batched) çıkarım (2 kat hızlı ama kelimelerin ~%30'unu kaçırdı).
 - **Çıktı:** Altyazı videoya gömülür (`clip_NN.mp4`); ayrıca platformlara ayrı yüklemek için `clip_NN.srt` yazılır. `--layout original` seçilirse yalnızca SRT üretilir.
-- GPU olmayan makinede yerel testleri hızlandırmak için `KAC_WHISPER_MODEL=small` kullanılabilir. Altyazı istemiyorsanız `--no-subtitles`.
+- GPU olmayan makinede yerel testleri hızlandırmak için `KAC_WHISPER_MODEL=small` kullanılabilir (doğruluk düşer). Altyazı istemiyorsanız `--no-subtitles`.
+
+### Ses
+
+- **Konuşma güçlendirme:** Klibin sesi vokal ve arka plan olarak ayrıştırılır (HDemucs, torchaudio); vokal olduğu gibi kalır, müzik/masa/kalabalık sesi ~8 dB kısılır. Arka plan tamamen silinmediği için ayrıştırma artefaktları duyulmaz. `--no-voice-boost` ile kapatılabilir.
+- **Ses yüksekliği:** 70 Hz altı kesilir, hafif sıkıştırma uygulanır, platformların hedeflediği -14 LUFS'a normalize edilir (ölçülen: -13,3 ile -14,7 LUFS arası).
 
 Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bırakılarak tepkilerin en yoğun olduğu pencereye kırpılır. Dolgu nedeniyle çakışan klipler sınır aşılmıyorsa birleştirilir, aşılıyorsa düşük skorlu olan çakışmayacak şekilde kısaltılır.
 
@@ -75,8 +85,9 @@ Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bı
 | `--max-clips` | `0` | En yüksek skorlu N klip (0 = hepsi) |
 | `--layout` | `blur` | `blur`, `crop` veya `original` (yalnızca `run`) |
 | `--encoder` | `auto` | `auto`, `nvenc` veya `cpu` (yalnızca `run`) |
-| `--whisper-model` | `large-v3-turbo` | Altyazı modeli (yalnızca `run`) |
+| `--whisper-model` | `large-v3` | Altyazı modeli (yalnızca `run`) |
 | `--no-subtitles` | | Altyazı üretme (yalnızca `run`) |
+| `--no-voice-boost` | | Konuşma güçlendirmeyi atla (yalnızca `run`) |
 | `--refresh-chat` | | Önbellekteki sohbeti yeniden indir |
 
 `kac detect` elenen sıçramaları gerekçesiyle listeler:
@@ -109,7 +120,8 @@ Elenen: 1 sıçrama
 | `KAC_WORKDIR` | `workspace` | Çıktı klasörü |
 | `KAC_CHAT_WORKERS` | `16` | Sohbet indirmede paralel istek sayısı |
 | `KAC_ENCODER` | `auto` | Video kodlayıcı (`--encoder` her zaman önceliklidir) |
-| `KAC_WHISPER_MODEL` | `large-v3-turbo` | Altyazı modeli (`--whisper-model` her zaman önceliklidir) |
+| `KAC_WHISPER_MODEL` | `large-v3` | Altyazı modeli (`--whisper-model` her zaman önceliklidir) |
+| `KAC_CLIP_WORKERS` | `3` (CPU kodlamada `2`) | Aynı anda hazırlanan klip sayısı |
 
 ## Nasıl çalışır
 
@@ -134,7 +146,7 @@ Elenen: 1 sıçrama
 
 Sohbetin ilk indirilişi ~30 sn sürer. CPU kodlamada (libx264) 480p klip üretimi ~48 sn sürdü.
 
-Altyazı ile (480p, `large-v3-turbo`, CUDA): 10 klip ~65–70 sn; klip başına indirme ~1 sn, kodlama ~1,7 sn, konuşma tanıma ~6–7 sn. Konuşma tanıma GPU'da sırayla yapılır; bu sırada diğer klipler indirilip kodlanır. Yeni GPU mimarilerinde CUDA çekirdekleri ilk çalıştırmada derlendiği için ilk çalıştırma ~15 sn daha uzun sürer.
+Altyazı ve konuşma güçlendirme ile (480p, `large-v3`, CUDA, RTX 5070 Ti dizüstü): 10 klip 80–300 sn. Klip başına indirme ~1 sn, ses işleme ~2–3 sn, kodlama ~2–3 sn; geri kalanı konuşma tanıma. Konuşma tanıma süresi aynı iş için 4–17 sn arasında değişiyor: dizüstü GPU güç yönetimi, kısa aralıklarla gelen yükte bellek saatini düşürüyor (ölçümde 9001 → 405 MHz). NVIDIA Denetim Masası'nda `python.exe` için "Güç yönetimi modu: Maksimum performansı tercih et" seçmek ve Windows güç planını "Yüksek performans" yapmak bu dalgalanmayı azaltır.
 
 ## Testler
 

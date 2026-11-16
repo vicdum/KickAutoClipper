@@ -21,6 +21,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 LAYOUTS = ("blur", "crop", "original")
+
+# Konuşma odaklı ses: 70 Hz altındaki uğultuyu kes, dinamikleri hafifçe sıkıştır (fısıltı ile
+# bağırma arası farkı azaltır), platformların hedeflediği -14 LUFS ses yüksekliğine normalize et.
+AUDIO_FILTER = (
+    "highpass=f=70,"
+    "acompressor=threshold=-21dB:ratio=3:attack=5:release=120:makeup=2,"
+    "loudnorm=I=-14:TP=-1.5:LRA=11"
+)
 ENCODERS = ("auto", "nvenc", "cpu")
 
 
@@ -97,15 +105,17 @@ class OutputFormat:
             f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps={self.fps}{subs},format=yuv420p[v]"
         )
 
-    def ffmpeg_args(self, subtitles: str | None = None) -> list[str]:
-        """Girdi sonrası ffmpeg argümanları (çıktı yolu hariç)."""
+    def ffmpeg_args(self, subtitles: str | None = None, external_audio: bool = False) -> list[str]:
+        """Girdi sonrası ffmpeg argümanları (çıktı yolu hariç). `external_audio`: ses ikinci
+        girdiden (ör. konuşması güçlendirilmiş WAV) alınır."""
         if self.layout == "original":
             return ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
         return [
             "-filter_complex", self.filter_complex(subtitles),
-            "-map", "[v]", "-map", "0:a:0?",
+            "-map", "[v]", "-map", "1:a:0" if external_audio else "0:a:0?",
             *self.video_codec_args(),
             "-g", str(self.fps * 2),
+            "-af", AUDIO_FILTER,
             "-c:a", "aac", "-b:a", self.audio_bitrate, "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
         ]

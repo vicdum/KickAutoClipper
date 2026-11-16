@@ -1,6 +1,8 @@
 """Konuşmayı yazıya döker ve kısa video platformlarına uygun altyazı üretir.
 
 - Konuşma tanıma: faster-whisper (CTranslate2). NVIDIA GPU varsa CUDA, yoksa CPU (int8).
+  Klipten önceki 15 sn bağlam olarak verilir; kelime zamanları zorlamalı hizalamayla
+  düzeltilir (bkz. `speech.py`).
 - Kelime düzeyinde zaman damgaları ile kısa (en fazla birkaç kelimelik) altyazı
   parçaları oluşturulur; konuşulan kelime renkle vurgulanır (Shorts/TikTok stili).
 - Çıktılar: videoya gömülecek ASS dosyası ve ayrıca yüklenebilecek SRT dosyası.
@@ -16,7 +18,11 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_MODEL = "large-v3-turbo"
+from . import speech as _speech
+
+# Türkçe dahil İngilizce dışı dillerde large-v3, turbo sürümünden belirgin daha doğru
+# (turbo'da kod çözücü katmanları 32'den 4'e indirilmiştir).
+DEFAULT_MODEL = "large-v3"
 
 # Whisper'ın sessizlik/müzik üzerinde sık uydurduğu kalıplar (özellikle Türkçe altyazı veri setlerinden).
 _HALLUCINATIONS = re.compile(
@@ -31,6 +37,7 @@ class Word:
     start: float
     end: float
     text: str
+    sentence_end: bool = False  # Whisper segmentinin son kelimesi (noktalama olmasa da cümle sınırı)
 
 
 @dataclass
@@ -90,34 +97,79 @@ class Transcriber:
         self.model_name = model
         self._lock = threading.Lock()
 
-    def transcribe(self, media: Path, language: str | None = None, start: float = 0.0, duration: float | None = None) -> list[Word]:
-        """`media` dosyasının [start, start+duration] aralığını yazıya döker; zamanlar aralık başına göredir."""
-        audio = load_audio(media, start, duration)
+    def transcribe(
+        self,
+        media: Path,
+        language: str | None = None,
+        start: float = 0.0,
+        duration: float | None = None,
+        context: float = 15.0,
+        align: bool = True,
+    ) -> list[Word]:
+        """`media` dosyasının [start, start+duration] aralığını yazıya döker; zamanlar `start`'a göredir.
+
+        - `context`: aralıktan önceki bu kadar saniye de modele verilir. Klip bir cümlenin
+          ortasında başlayabildiği için bağlam tanıma doğruluğunu belirgin artırır; bu
+          bölümdeki kelimeler sonuçtan çıkarılır.
+        - `align`: PyTorch kuruluysa kelime zamanları zorlamalı hizalamayla düzeltilir
+          (Whisper'ın 1-2 sn'lik kaymalarını giderir).
+        """
+        ctx_start = max(0.0, start - context)
+        pre = start - ctx_start
+        audio = load_audio(media, ctx_start, None if duration is None else duration + pre)
         with self._lock:
-            segments, _ = self.model.transcribe(
+            # Whisper zor bölümlerde rastgele örneklemeye (sıcaklık > 0) geçer; tohum sabitlenmezse
+            # aynı ses her çalıştırmada farklı metin üretebilir.
+            import ctranslate2
+
+            ctranslate2.set_random_seed(0)
+            result, _ = self.model.transcribe(
                 audio,
                 language=language,
+                # Kelime zamanları hizalamada düzeltilse de kapatılmamalı: Whisper bir sonraki
+                # 30 sn'lik pencereye nereden devam edeceğini bunlarla belirler; kapalıyken
+                # pencereler atlanıp metnin bir kısmı kaybolabiliyor.
                 word_timestamps=True,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
                 condition_on_previous_text=False,  # tekrar döngülerini ve uydurmaları azaltır
+                # Sessizlik tespiti yalnızca VAD ile yapılır. Whisper'ın kendi "konuşma yok" kararı
+                # (no_speech_prob > 0.6 ve düşük güven) gürültülü ortamda konuşma olan 30 sn'lik
+                # pencerenin tamamını atabiliyor; bir klipte 35 sn'lik konuşma bu yüzden kayboldu.
+                # Aynı nedenle hallucination_silence_threshold da kullanılmıyor. Uydurmalara karşı
+                # VAD ve bilinen kalıp filtresi yeterli.
+                no_speech_threshold=None,
                 beam_size=5,
             )
-            words: list[Word] = []
-            for seg in segments:
-                if _HALLUCINATIONS.search(seg.text) or seg.no_speech_prob > 0.8:
-                    continue
-                for w in seg.words or []:
-                    text = w.word.strip()
-                    if not text:
-                        continue
-                    # Boşlukla başlamayan parça önceki kelimenin devamıdır ("Enes" + "'in", "3" + ".000").
-                    if words and not w.word.startswith(" "):
-                        words[-1].text += text
-                        words[-1].end = round(w.end, 3)
-                    else:
-                        words.append(Word(round(w.start, 3), round(w.end, 3), text))
+            segments = [_merge_pieces(s) for s in result if not _HALLUCINATIONS.search(s.text)]
+        segments = [s for s in segments if s[2]]
+
+        if align and _speech.available():
+            timed = _speech.align_segments(audio, segments)
+            segments = [(s0, s1, [(a, b, w[2]) for (a, b), w in zip(t, ws)]) for (s0, s1, ws), t in zip(segments, timed)]
+
+        words = []
+        for _, _, ws in segments:
+            for k, (a, b, text) in enumerate(ws):
+                if b - pre > 0.05:  # bağlam bölümündeki kelimeleri at
+                    words.append(Word(round(max(a - pre, 0.0), 3), round(b - pre, 3), text, k == len(ws) - 1))
         return words
+
+
+def _merge_pieces(seg) -> tuple[float, float, list[tuple[float, float, str]]]:
+    """Segmentin kelimelerini (başlangıç, bitiş, metin) olarak döner. Boşlukla başlamayan
+    parça önceki kelimenin devamıdır ("Enes" + "'in", "3" + ".000")."""
+    words: list[list] = []
+    for w in seg.words or []:
+        text = w.word.strip()
+        if not text:
+            continue
+        if words and not w.word.startswith(" "):
+            words[-1][1] = w.end
+            words[-1][2] += text
+        else:
+            words.append([w.start, w.end, text])
+    return seg.start, seg.end, [tuple(w) for w in words]
 
 
 def load_audio(media: Path, start: float = 0.0, duration: float | None = None, sr: int = 16000):
@@ -130,6 +182,30 @@ def load_audio(media: Path, start: float = 0.0, duration: float | None = None, s
     cmd += ["-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"]
     raw = subprocess.run(cmd, capture_output=True, check=True).stdout
     return np.frombuffer(raw, dtype=np.float32)
+
+
+def load_stereo(media: Path, start: float, duration: float, sr: int = 44100):
+    """ffmpeg ile (2, N) float32 stereo ses okur."""
+    import numpy as np
+
+    cmd = ["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-i", str(media), "-t", f"{duration:.3f}",
+           "-vn", "-ac", "2", "-ar", str(sr), "-f", "f32le", "-"]
+    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).T.copy()
+
+
+def write_wav(path: Path, stereo, sr: int) -> None:
+    """(2, N) float32 sesi 16-bit PCM WAV olarak yazar."""
+    import wave
+
+    import numpy as np
+
+    pcm = (np.clip(stereo.T, -1, 1) * 32767).astype("<i2").tobytes()
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(2)
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes(pcm)
 
 
 # --- altyazı parçaları -------------------------------------------------------
@@ -148,6 +224,7 @@ def build_cues(words: list[Word], max_words: int = 3, max_chars: int = 22, max_g
                 or text_len > max_chars
                 or w.start - cur[-1].end > max_gap
                 or cur[-1].text[-1] in ".!?…"
+                or cur[-1].sentence_end
             ):
                 cues.append(Cue(cur[0].start, cur[-1].end, cur))
                 cur = []
@@ -166,7 +243,8 @@ def shift(cues: list[Cue], seconds: float) -> list[Cue]:
     if not seconds:
         return cues
     return [
-        Cue(c.start + seconds, c.end + seconds, [Word(w.start + seconds, w.end + seconds, w.text) for w in c.words])
+        Cue(c.start + seconds, c.end + seconds,
+            [Word(w.start + seconds, w.end + seconds, w.text, w.sentence_end) for w in c.words])
         for c in cues
     ]
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,10 @@ from .detect import Clip, DetectParams, detect
 from .hls import MediaPlaylist, cut, fetch_range, load_playlist
 from .kick_api import KickError, Vod, get_vod
 from .render import ENCODERS, LAYOUTS, OutputFormat, resolve_encoder
-from .subtitles import Transcriber, build_cues, shift, to_ass, to_srt
+from . import speech
+from .subtitles import Transcriber, build_cues, load_stereo, shift, to_ass, to_srt, write_wav
+
+CONTEXT = 15.0  # altyazı tanımada klipten önce modele verilen bağlam (sn)
 from .video import download_video, find_ffmpeg
 
 
@@ -127,7 +131,12 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         t0 = time.perf_counter()
         model = args.whisper_model or settings.whisper_model
         transcriber = Transcriber(model)
-        print(f"Altyazı modeli: {model} ({transcriber.device}, {time.perf_counter() - t0:.1f} sn)")
+        print(f"Altyazı modeli: {model} ({transcriber.device}, {time.perf_counter() - t0:.1f} sn)"
+              + ("" if speech.available() else " — PyTorch yok: kelime zamanları hizalanmayacak"))
+    boost = args.voice_boost and fmt.layout != "original"
+    if boost and not speech.available():
+        print("Konuşma güçlendirme için PyTorch gerekli (pip install -e \".[gpu]\"); atlanıyor.")
+        boost = False
     t0 = time.perf_counter()
 
     def make_clip(item: tuple[int, Clip]) -> dict:
@@ -135,30 +144,42 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         name = f"clip_{i:02d}_{hms(c.start).replace(':', '')}"
         out = clip_dir / f"{name}.mp4"
         t = [time.perf_counter()]
-        src = fetch_range(job.playlist, c.start, c.end, clip_dir)
+        # Altyazı bağlamı için klipten önceki CONTEXT saniye de indirilir.
+        src = fetch_range(job.playlist, max(0.0, c.start - (CONTEXT if transcriber else 0)), c.end, clip_dir)
         t.append(time.perf_counter())
+        ass, voice, cues = None, None, []
         try:
-            ass, cues = None, []
             if transcriber:
                 # Ses, kesilecek aralığın aynısından okunur; zamanlar c.start'a göredir.
-                words = transcriber.transcribe(src.path, job.vod.language, src.offset(c.start), c.duration)
+                words = transcriber.transcribe(src.path, job.vod.language, src.offset(c.start), c.duration, context=CONTEXT)
                 cues = build_cues(words)
                 if fmt.layout != "original" and cues:
                     ass = f"{name}.ass"
                     (clip_dir / ass).write_text(to_ass(cues, fmt.width, fmt.height, language=job.vod.language), encoding="utf-8")
             t.append(time.perf_counter())
-            encode_args = None if fmt.layout == "original" else fmt.ffmpeg_args(subtitles=ass)
-            actual = cut(src, c.start, c.end, out, ffmpeg=ffmpeg, encode_args=encode_args)
+            if boost:
+                voice = clip_dir / f"{name}.voice.wav"
+                write_wav(voice, speech.voice_boost(load_stereo(src.path, src.offset(c.start), c.duration), 44100), 44100)
             t.append(time.perf_counter())
-            sub = f", altyazı {t[2] - t[1]:4.1f} sn ({len(cues)} satır)" if transcriber else ""
-            print(f"  {name}: indirme {t[1] - t[0]:4.1f} sn{sub}, kodlama {t[3] - t[2]:4.1f} sn")
+            encode_args = None if fmt.layout == "original" else fmt.ffmpeg_args(subtitles=ass, external_audio=voice is not None)
+            actual = cut(src, c.start, c.end, out, ffmpeg=ffmpeg, encode_args=encode_args,
+                         extra_inputs=[voice] if voice else None)
+            t.append(time.perf_counter())
+            parts = [f"indirme {t[1] - t[0]:4.1f} sn"]
+            if transcriber:
+                parts.append(f"altyazı {t[2] - t[1]:4.1f} sn ({len(cues)} satır)")
+            if boost:
+                parts.append(f"ses {t[3] - t[2]:4.1f} sn")
+            parts.append(f"kodlama {t[4] - t[3]:4.1f} sn")
+            print(f"  {name}: " + ", ".join(parts))
             if transcriber:
                 # Kodlamasız kesim anahtar kareye çekildiyse altyazıyı aynı miktar kaydır.
                 (clip_dir / f"{name}.srt").write_text(to_srt(shift(cues, c.start - actual)), encoding="utf-8")
         finally:
             src.path.unlink(missing_ok=True)
-        if ass:
-            (clip_dir / ass).unlink(missing_ok=True)  # videoya gömüldü; SRT ayrıca saklanır
+            for tmp in (ass and clip_dir / ass, voice):  # videoya gömüldü; SRT ayrıca saklanır
+                if tmp:
+                    tmp.unlink(missing_ok=True)
         # file_start: klip dosyasının ilk karesinin video zamanı
         return {**c.to_dict(), "file": f"clips/{out.name}", "file_start": round(actual, 3)}
 
@@ -166,7 +187,8 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     print(f"Klipler hazırlanıyor ({layout}{', altyazılı' if transcriber else ''})...")
     # libx264 zaten tüm çekirdekleri kullanır; GPU kodlamada filtreler CPU'da kaldığı için 3 iş iyi dengeler.
     # Altyazı tanıma GPU'da sıraya alınır; bu sırada diğer klipler indirilip kodlanır.
-    with ThreadPoolExecutor(max_workers=2 if fmt.encoder == "cpu" and fmt.layout != "original" else 3) as pool:
+    workers = int(os.environ.get("KAC_CLIP_WORKERS", 2 if fmt.encoder == "cpu" and fmt.layout != "original" else 3))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         rows = list(pool.map(make_clip, enumerate(clips, 1)))
     (job.dir / "clips.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     paths = [job.dir / r["file"] for r in rows]
@@ -226,8 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--encoder", choices=ENCODERS,
                    help="Video kodlayıcı: auto (NVIDIA GPU varsa onu kullanır), nvenc, cpu. Varsayılan: KAC_ENCODER veya auto")
     r.add_argument("--no-subtitles", dest="subtitles", action="store_false", help="Altyazı üretme")
+    r.add_argument("--no-voice-boost", dest="voice_boost", action="store_false",
+                   help="Konuşmayı öne çıkarma (vokal ayrıştırıp arka planı kısma) adımını atla")
     r.add_argument("--whisper-model",
-                   help="faster-whisper modeli (tiny, base, small, medium, large-v3, large-v3-turbo). Varsayılan: KAC_WHISPER_MODEL veya large-v3-turbo")
+                   help="faster-whisper modeli (tiny, base, small, medium, large-v3, large-v3-turbo). Varsayılan: KAC_WHISPER_MODEL veya large-v3")
     r.set_defaults(func=cmd_run)
 
     dt = sub.add_parser("detect", help="Sohbetten anları tespit et (video indirmez)")

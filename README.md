@@ -4,9 +4,9 @@ Kick yayınlarındaki viral olabilecek anları sohbet yoğunluğundan tespit edi
 
 ## Yol haritası
 
-- [x] **1. İndirme** — VOD videosu (varsayılan 1080p) ve zaman damgalı sohbet geçmişi
-- [ ] **2. Tespit** — sohbetin mesaj/dakika oranının zaman penceresine göre sıçradığı anlar
-- [ ] **3. Kesme** — sıçramadan 15 sn önce ile oranın tekrar düştüğü andan 15 sn sonrası arası
+- [x] **1. İndirme** — zaman damgalı sohbet geçmişi; video yalnızca gereken aralıklar için (varsayılan 1080p)
+- [x] **2. Tespit** — sohbetin mesaj/dakika oranının zaman penceresine göre sıçradığı anlar
+- [x] **3. Kesme** — sıçramadan 15 sn önce ile oranın tekrar düştüğü andan 15 sn sonrası arası
 - [ ] **4. Altyazı** — kesilen klipler için otomatik altyazı
 
 ## Kurulum
@@ -22,23 +22,43 @@ pip install -e .
 ## Kullanım
 
 ```bash
-kac download https://kick.com/<kanal>/videos/<uuid>
+kac run https://kick.com/<kanal>/videos/<uuid>
 ```
 
-| Seçenek | Açıklama |
+`run` akışı yayının tamamını indirmez:
+
+1. Sohbet geçmişi indirilir (saatlik yayın için ~30 sn).
+2. Mesaj/dakika sıçramaları tespit edilir, `clips.json` yazılır.
+3. Videodan **yalnızca klip aralıklarına denk gelen HLS segmentleri** indirilir ve yeniden kodlamadan kesilir.
+
+| Komut | Ne yapar |
 | --- | --- |
-| `-q, --quality` | Maksimum yükseklik (1080, 720, 480, 360, 160). Varsayılan 1080 |
-| `-o, --workdir` | Çıktı klasörü. Varsayılan `workspace/` |
-| `--chat-only` / `--video-only` | Yalnızca sohbeti ya da yalnızca videoyu indir |
+| `kac run <url>` | Sohbet → tespit → klipler |
+| `kac detect <url>` | Yalnızca tespit; video indirmez. Parametre ayarlamak için (sohbet önbellekten okunur) |
+| `kac download <url>` | Videonun tamamını ve sohbeti indirir |
+
+| Seçenek | Varsayılan | Açıklama |
+| --- | --- | --- |
+| `-q, --quality` | `1080` | Maksimum yükseklik (1080, 720, 480, 360, 160) |
+| `-o, --workdir` | `workspace` | Çıktı klasörü |
+| `--window` | `30` | Anlık mesaj/dk oranının hesaplandığı pencere (sn) |
+| `--baseline` | `600` | Taban çizgisi (kayan medyan) penceresi (sn) |
+| `--ratio` | `2.0` | Oran, tabanın kaç katını aşınca sıçrama sayılır |
+| `--min-rate` | `10` | Sıçrama için minimum mesaj/dk |
+| `--pad` | `15` | Sıçramadan önce / düşüşten sonra eklenecek süre (sn) |
+| `--max-clips` | `0` | En yüksek skorlu N klip (0 = hepsi) |
+| `--refresh-chat` | | Önbellekteki sohbeti yeniden indir |
 
 Çıktılar `workspace/<kanal>/<vod-uuid>/` altına yazılır:
 
-- `video.mp4` — HLS akışından yeniden kodlamadan alınan video
-- `chat.jsonl` — her satır bir mesaj; `t` alanı VOD başından itibaren saniyedir
-- `meta.json` — VOD bilgileri (başlangıç/bitiş zamanı, süre, kanal, kalite)
+- `chat.jsonl` — her satır bir mesaj; `t` alanı videonun ilk karesinden itibaren saniyedir
+- `clips.json` — tespit edilen anlar (başlangıç/bitiş, zirve oranı, taban, skor); `file_start`, klip dosyasının ilk karesinin video zamanıdır (anahtar kareye hizalı, istenen başlangıçtan en fazla ~2 sn önce)
+- `clips/clip_NN_HHMMSS.mp4` — kesilen klipler
+- `meta.json` — VOD bilgileri
+- `video.mp4` — yalnızca `kac download` ile
 
 ```json
-{"t": 1.0, "created_at": "2026-11-06T19:30:13Z", "id": "…", "type": "message", "user_id": 127462302, "user": "zSkyrex31", "content": "!izleme top"}
+{"t": 1.457, "created_at": "2026-11-06T19:30:11Z", "id": "…", "type": "message", "user_id": 127462302, "user": "zSkyrex31", "content": "!izleme top"}
 ```
 
 ### Yerel ayarlar
@@ -54,11 +74,19 @@ kac download https://kick.com/<kanal>/videos/<uuid>
 ## Nasıl çalışır
 
 - **VOD bilgisi:** `web.kick.com/api/v1/channels/{kanal_id}/videos/{uuid}` uç noktasından kayıt adresi (HLS `master.m3u8`), başlangıç/bitiş zamanı ve süre alınır.
-- **Video:** `yt-dlp`, istenen yüksekliği aşmayan en iyi varyantı 16 paralel parça ile indirip MP4'e paketler.
 - **Sohbet:** `kick.com/api/v2/channels/{kanal_id}/messages?cursor=<µs>` verilen andan geriye doğru boşluksuz 25'er mesaj döner. Yayın 60 sn'lik parçalara bölünür, her parça paralel olarak kendi sonundan başına doğru sayfalanır, çakışmalar mesaj kimliğiyle ayıklanır.
-- Video ve sohbet indirmeleri aynı anda çalışır. Kick Cloudflare arkasında olduğu için istekler `curl_cffi` ile tarayıcı parmak izi taklit edilerek gönderilir.
+- **Zaman hizalama:** Videonun sıfır noktası, oynatma listesindeki ilk segmentin `#EXT-X-PROGRAM-DATE-TIME` değeridir (API'nin `start_time` değerinden birkaç saniye farklı olabilir). Sohbetteki `t` buna göre hesaplanır.
+- **Tespit:** Mesajlar saniyelik sayılır; 30 sn'lik ortalanmış pencerede mesaj/dk oranı hesaplanır. Taban çizgisi bu oranın 10 dk'lık kayan medyanıdır, böylece yayının doğal akışı izlenirken sıçramalar tabanı bozmaz. Oranın `max(2 × taban, 10)` eşiğini aştığı bölgeler sıçramadır. 10 sn'den yakın sıçramalar birleştirilir, 5 sn'den kısalar elenir, dolgu sonrası çakışan klipler birleştirilir.
+- **Klip indirme:** Kick VOD'ları ~10 sn'lik MPEG-TS segmentlerinden oluşur. Her klip için yalnızca ilgili segmentler paralel indirilir, birleştirilir ve FFmpeg ile yeniden kodlamadan (stream copy) kesilir.
+- Kick Cloudflare arkasında olduğu için istekler `curl_cffi` ile tarayıcı parmak izi taklit edilerek gönderilir.
 
-Örnek ölçüm (58 dk VOD, 480p): video ~40 sn (589 MB), sohbet ~20–30 sn (3968 mesaj).
+Örnek ölçüm (58 dk VOD, 480p): sohbet ~30 sn (3968 mesaj), tespit <1 sn, 10 klip (13 dk, 123 MB) ~5 sn. Toplam ~35 sn. Karşılaştırma için videonun tamamını indirmek ~40 sn ve 589 MB sürüyor; aradaki fark yayın uzadıkça ve çözünürlük arttıkça büyür.
+
+## Testler
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## Lisans
 

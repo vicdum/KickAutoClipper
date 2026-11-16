@@ -69,10 +69,16 @@ def download_chat(
     workers: int = 16,
     segment_seconds: int = 60,
     progress: Callable[[int, int], None] | None = None,
+    zero: datetime | None = None,
 ) -> int:
-    """VOD sohbetini `out_path` dosyasına JSONL olarak yazar, mesaj sayısını döner."""
-    start = vod.start
-    end = max(vod.end, start + timedelta(seconds=vod.duration)) + timedelta(seconds=1)
+    """VOD sohbetini `out_path` dosyasına JSONL olarak yazar, mesaj sayısını döner.
+
+    `zero`, videonun ilk karesinin duvar saatidir (HLS PROGRAM-DATE-TIME). Verilirse
+    `t` alanı buna göre hesaplanır; yoksa API'nin `start_time` değeri kullanılır.
+    """
+    zero = zero or vod.start
+    start = min(zero, vod.start)
+    end = max(vod.end, zero + timedelta(seconds=vod.duration)) + timedelta(seconds=1)
     segments = list(_segments(start, end, timedelta(seconds=segment_seconds)))
 
     by_id: dict[str, dict] = {}
@@ -85,7 +91,7 @@ def download_chat(
                 progress(done, len(futures))
 
     rows = [
-        _normalize(m, start)
+        _normalize(m, zero)
         for m in by_id.values()
         if start <= parse_iso(m["created_at"]) < end
     ]

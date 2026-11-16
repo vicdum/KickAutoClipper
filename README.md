@@ -7,7 +7,7 @@ Kick yayınlarındaki viral olabilecek anları sohbet yoğunluğundan tespit edi
 - [x] **1. İndirme** — zaman damgalı sohbet geçmişi; video yalnızca gereken aralıklar için (varsayılan 1080p)
 - [x] **2. Tespit** — sohbetin mesaj/dakika oranının zaman penceresine göre sıçradığı anlar
 - [x] **3. Kesme** — sıçramadan 15 sn önce ile oranın tekrar düştüğü andan 15 sn sonrası arası
-- [ ] **4. Altyazı** — kesilen klipler için otomatik altyazı
+- [x] **4. Altyazı** — konuşma tanıma ile kelime vurgulu, videoya gömülü altyazı + ayrı SRT
 
 ## Kurulum
 
@@ -16,8 +16,10 @@ Gereksinimler: Python 3.10+, [FFmpeg](https://ffmpeg.org/) (PATH'te olmalı; Win
 ```bash
 python -m venv .venv
 .venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
-pip install -e .
+pip install -e ".[gpu]"      # NVIDIA GPU yoksa: pip install -e .
 ```
+
+`[gpu]` eki altyazı üretimi için CUDA kütüphanelerini (cuBLAS, cuDNN) kurar. Altyazı modeli (~1,6 GB) ilk çalıştırmada bir kez indirilir.
 
 ## Kullanım
 
@@ -29,7 +31,8 @@ kac run https://kick.com/<kanal>/videos/<uuid>
 
 1. Sohbet geçmişi indirilir (saatlik yayın için ~30 sn).
 2. Mesaj/dakika sıçramaları tespit edilir; selamlaşma, vedalaşma ve yayın kesintisi kaynaklı sıçramalar elenir, `clips.json` yazılır.
-3. Videodan **yalnızca klip aralıklarına denk gelen HLS segmentleri** indirilir ve YouTube Shorts / TikTok / Instagram Reels için dikey klip olarak kodlanır.
+3. Videodan **yalnızca klip aralıklarına denk gelen HLS segmentleri** indirilir.
+4. Aynı segmentlerden konuşma yazıya dökülür ve altyazı, YouTube Shorts / TikTok / Instagram Reels için dikey kodlamayla **tek geçişte** videoya gömülür.
 
 ### Kısa video çıktısı
 
@@ -41,6 +44,14 @@ kac run https://kick.com/<kanal>/videos/<uuid>
 | Boyut | Bit hızı 1080x1920'de 8 Mbps ile sınırlı; 60 sn ≈ 45 MB (TikTok mobil sınırı 287 MB) |
 | Yerleşim | `blur`: yatay görüntü ortada, arka planda bulanık kopyası (içerik kaybı yok, varsayılan). `crop`: ortadan 9:16 kesit. `original`: yatay, kodlamasız kopya |
 | Kodlayıcı | NVIDIA GPU varsa `h264_nvenc`, yoksa `libx264` (`--encoder`) |
+
+### Altyazı
+
+- **Konuşma tanıma:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper), varsayılan model `large-v3-turbo`, dil VOD bilgisinden (ör. `tr`). NVIDIA GPU varsa CUDA (float16), yoksa CPU (int8) kullanılır.
+- **Görünüm:** Kısa video stili; en fazla 3 kelime / 22 karakterlik parçalar, büyük kalın beyaz yazı, siyah kenar çizgisi, konuşulan kelime sarı. Yazı, `blur` yerleşiminde görüntünün hemen altındaki bulanık alanda durur. Türkçe büyük harf kuralı (i → İ) uygulanır.
+- **Doğruluk önlemleri:** Ses etkinliği algılama (VAD) ile sessiz bölümler atlanır, önceki metne koşullama kapalıdır (tekrar döngülerini önler), Whisper'ın sessizlikte uydurduğu bilinen kalıplar ("Altyazı M.K.", "abone olmayı unutmayın"…) elenir, parçalı gelen kelimeler birleştirilir ("Enes" + "'in").
+- **Çıktı:** Altyazı videoya gömülür (`clip_NN.mp4`); ayrıca platformlara ayrı yüklemek için `clip_NN.srt` yazılır. `--layout original` seçilirse yalnızca SRT üretilir.
+- GPU olmayan makinede yerel testleri hızlandırmak için `KAC_WHISPER_MODEL=small` kullanılabilir. Altyazı istemiyorsanız `--no-subtitles`.
 
 Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bırakılarak tepkilerin en yoğun olduğu pencereye kırpılır. Dolgu nedeniyle çakışan klipler sınır aşılmıyorsa birleştirilir, aşılıyorsa düşük skorlu olan çakışmayacak şekilde kısaltılır.
 
@@ -64,6 +75,8 @@ Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bı
 | `--max-clips` | `0` | En yüksek skorlu N klip (0 = hepsi) |
 | `--layout` | `blur` | `blur`, `crop` veya `original` (yalnızca `run`) |
 | `--encoder` | `auto` | `auto`, `nvenc` veya `cpu` (yalnızca `run`) |
+| `--whisper-model` | `large-v3-turbo` | Altyazı modeli (yalnızca `run`) |
+| `--no-subtitles` | | Altyazı üretme (yalnızca `run`) |
 | `--refresh-chat` | | Önbellekteki sohbeti yeniden indir |
 
 `kac detect` elenen sıçramaları gerekçesiyle listeler:
@@ -77,7 +90,8 @@ Elenen: 1 sıçrama
 
 - `chat.jsonl` — her satır bir mesaj; `t` alanı videonun ilk karesinden itibaren saniyedir
 - `clips.json` — tespit edilen anlar (başlangıç/bitiş, zirve anı ve oranı, taban, skor, gürültü oranları); `file_start`, klip dosyasının ilk karesinin video zamanıdır (`original` yerleşiminde anahtar kareye hizalandığı için en fazla ~2 sn önce olabilir)
-- `clips/clip_NN_HHMMSS.mp4` — kesilen klipler
+- `clips/clip_NN_HHMMSS.mp4` — altyazısı gömülü dikey klipler
+- `clips/clip_NN_HHMMSS.srt` — klibin altyazısı (zamanlar klip başına göre)
 - `meta.json` — VOD bilgileri
 - `video.mp4` — yalnızca `kac download` ile
 
@@ -95,6 +109,7 @@ Elenen: 1 sıçrama
 | `KAC_WORKDIR` | `workspace` | Çıktı klasörü |
 | `KAC_CHAT_WORKERS` | `16` | Sohbet indirmede paralel istek sayısı |
 | `KAC_ENCODER` | `auto` | Video kodlayıcı (`--encoder` her zaman önceliklidir) |
+| `KAC_WHISPER_MODEL` | `large-v3-turbo` | Altyazı modeli (`--whisper-model` her zaman önceliklidir) |
 
 ## Nasıl çalışır
 
@@ -118,6 +133,8 @@ Elenen: 1 sıçrama
 | 1080p (1080x1920) | ~77 sn | 383 MB |
 
 Sohbetin ilk indirilişi ~30 sn sürer. CPU kodlamada (libx264) 480p klip üretimi ~48 sn sürdü.
+
+Altyazı ile (480p, `large-v3-turbo`, CUDA): 10 klip ~65–70 sn; klip başına indirme ~1 sn, kodlama ~1,7 sn, konuşma tanıma ~6–7 sn. Konuşma tanıma GPU'da sırayla yapılır; bu sırada diğer klipler indirilip kodlanır. Yeni GPU mimarilerinde CUDA çekirdekleri ilk çalıştırmada derlendiği için ilk çalıştırma ~15 sn daha uzun sürer.
 
 ## Testler
 

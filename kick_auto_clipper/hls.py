@@ -166,49 +166,64 @@ def _keyframe_before(ts_path: Path, offset: float, ffprobe: str) -> float:
     return max(before) if before else 0.0
 
 
-def download_range(
-    pl: MediaPlaylist,
-    start: float,
-    end: float,
-    out_path: Path,
-    ffmpeg: str = "ffmpeg",
-    workers: int = 8,
-    encode_args: list[str] | None = None,
-) -> float:
-    """[start, end) aralığını (video saniyesi) MP4 olarak kaydeder, klibin gerçek başlangıcını döner.
+@dataclass
+class RangeFile:
+    """Bir aralığı kapsayan, uç uca eklenmiş segment dosyası."""
 
-    `encode_args` verilirse (ör. dikey çıktı) yeniden kodlanır ve kesim kare
-    hassasiyetindedir. Verilmezse yeniden kodlamadan kopyalanır; bu durumda kesim
-    `start` anından önceki son anahtar kareye çekilir (Kick'te ~2 sn arayla).
-    """
+    path: Path
+    file_start: float  # dosyanın ilk karesinin video zamanı (sn)
+
+    def offset(self, t: float) -> float:
+        """Video zamanını dosya içi zamana çevirir."""
+        return max(0.0, t - self.file_start)
+
+
+def fetch_range(pl: MediaPlaylist, start: float, end: float, work_dir: Path, workers: int = 8) -> RangeFile:
+    """[start, end) aralığını kapsayan segmentleri paralel indirip tek .ts dosyasında birleştirir.
+    Dosyayı silmek çağıranın sorumluluğundadır."""
     segs = pl.segments_between(start, end)
     if not segs:
         raise ValueError(f"Aralık videonun dışında: {start}-{end}")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         chunks = list(pool.map(_fetch, [s.url for s in segs]))
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(suffix=".ts", dir=out_path.parent, delete=False) as tmp:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".ts", dir=work_dir, delete=False) as tmp:
         for c in chunks:
             tmp.write(c)
-        joined = Path(tmp.name)
-    try:
-        offset = max(0.0, start - segs[0].start)
-        if encode_args is None:
-            ffprobe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
-            offset = _keyframe_before(joined, offset, ffprobe)
-            encode_args = ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
-        actual_start = segs[0].start + offset
-        subprocess.run(
-            [
-                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{offset:.3f}", "-i", str(joined),
-                "-t", f"{end - actual_start:.3f}",
-                *encode_args,
-                str(out_path),
-            ],
-            check=True,
-        )
-    finally:
-        joined.unlink(missing_ok=True)
+    return RangeFile(Path(tmp.name), segs[0].start)
+
+
+def cut(
+    src: RangeFile,
+    start: float,
+    end: float,
+    out_path: Path,
+    ffmpeg: str = "ffmpeg",
+    encode_args: list[str] | None = None,
+) -> float:
+    """`src` içinden [start, end) aralığını (video saniyesi) MP4 olarak kaydeder, klibin gerçek başlangıcını döner.
+
+    `encode_args` verilirse yeniden kodlanır ve kesim kare hassasiyetindedir. ffmpeg,
+    `out_path` klasöründe çalıştırılır; böylece filtrelerde (ör. `ass=`) dosya adları
+    kaçış karakteri gerektirmeden kullanılabilir. Verilmezse yeniden kodlamadan kopyalanır;
+    bu durumda kesim `start` anından önceki son anahtar kareye çekilir (Kick'te ~2 sn arayla).
+    """
+    offset = src.offset(start)
+    if encode_args is None:
+        ffprobe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
+        offset = _keyframe_before(src.path, offset, ffprobe)
+        encode_args = ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
+    actual_start = src.file_start + offset
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{offset:.3f}", "-i", str(src.path.resolve()),
+            "-t", f"{end - actual_start:.3f}",
+            *encode_args,
+            out_path.name,
+        ],
+        check=True,
+        cwd=out_path.parent,
+    )
     return actual_start

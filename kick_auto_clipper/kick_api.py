@@ -73,6 +73,7 @@ class Vod:
     end_time: str
     duration: float  # saniye
     playlist_url: str  # HLS master.m3u8
+    language: str | None = None  # yayın dili (ör. "tr")
 
     @property
     def start(self) -> datetime:
@@ -112,4 +113,5 @@ def get_vod(url: str) -> Vod:
         end_time=data["end_time"],
         duration=float(data["duration"]),
         playlist_url=data["recording_url"],
+        language=data.get("language"),
     )

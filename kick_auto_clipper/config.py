@@ -28,6 +28,7 @@ class Settings:
     workdir: Path
     chat_workers: int
     encoder: str
+    whisper_model: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,4 +38,5 @@ class Settings:
             workdir=Path(os.environ.get("KAC_WORKDIR", "workspace")),
             chat_workers=int(os.environ.get("KAC_CHAT_WORKERS", 16)),
             encoder=os.environ.get("KAC_ENCODER", "auto"),
+            whisper_model=os.environ.get("KAC_WHISPER_MODEL", "large-v3-turbo"),
         )

@@ -81,10 +81,12 @@ class OutputFormat:
         return ["-c:v", "libx264", "-preset", self.preset, "-crf", str(self.crf),
                 *rate, "-profile:v", "high", "-level", "4.1"]
 
-    def filter_complex(self) -> str:
+    def filter_complex(self, subtitles: str | None = None) -> str:
+        """`subtitles`: çalışma klasöründeki ASS dosyasının adı (videoya gömülür)."""
         w, h = self.width, self.height
+        subs = f",ass={subtitles}" if subtitles else ""
         if self.layout == "crop":
-            return f"[0:v]scale=-2:{h},crop={w}:{h},setsar=1,fps={self.fps},format=yuv420p[v]"
+            return f"[0:v]scale=-2:{h},crop={w}:{h},setsar=1,fps={self.fps}{subs},format=yuv420p[v]"
         # blur: arka plan küçük çözünürlükte bulanıklaştırılıp büyütülür (hızlı).
         bw, bh = _even(w / 6), _even(h / 6)
         return (
@@ -92,15 +94,15 @@ class OutputFormat:
             f"[bg]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},"
             f"boxblur=8:2,scale={w}:{h},setsar=1[bgb];"
             f"[fg]scale={w}:-2,setsar=1[fgs];"
-            f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps={self.fps},format=yuv420p[v]"
+            f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,fps={self.fps}{subs},format=yuv420p[v]"
         )
 
-    def ffmpeg_args(self) -> list[str]:
+    def ffmpeg_args(self, subtitles: str | None = None) -> list[str]:
         """Girdi sonrası ffmpeg argümanları (çıktı yolu hariç)."""
         if self.layout == "original":
             return ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
         return [
-            "-filter_complex", self.filter_complex(),
+            "-filter_complex", self.filter_complex(subtitles),
             "-map", "[v]", "-map", "0:a:0?",
             *self.video_codec_args(),
             "-g", str(self.fps * 2),

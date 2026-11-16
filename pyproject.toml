@@ -9,7 +9,11 @@ description = "Kick yayınlarındaki viral anları sohbet yoğunluğundan bulup 
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["curl_cffi>=0.7", "yt-dlp>=2025.1.1"]
+dependencies = ["curl_cffi>=0.7", "yt-dlp>=2025.1.1", "faster-whisper>=1.1", "numpy"]
+
+[project.optional-dependencies]
+# NVIDIA GPU ile altyazı üretimi için CUDA kütüphaneleri (Windows/Linux)
+gpu = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
 
 [project.scripts]
 kac = "kick_auto_clipper.cli:main"

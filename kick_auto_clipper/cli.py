@@ -17,9 +17,10 @@ from pathlib import Path
 from .chat import download_chat, load_chat
 from .config import Settings
 from .detect import Clip, DetectParams, detect
-from .hls import MediaPlaylist, download_range, load_playlist
+from .hls import MediaPlaylist, cut, fetch_range, load_playlist
 from .kick_api import KickError, Vod, get_vod
 from .render import ENCODERS, LAYOUTS, OutputFormat, resolve_encoder
+from .subtitles import Transcriber, build_cues, shift, to_ass, to_srt
 from .video import download_video, find_ffmpeg
 
 
@@ -117,24 +118,56 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
 
     encoder = resolve_encoder(args.encoder or settings.encoder, ffmpeg)
     fmt = OutputFormat.for_quality(job.playlist.height, args.layout, encoder)
-    encode_args = None if fmt.layout == "original" else fmt.ffmpeg_args()
     clip_dir = job.dir / "clips"
-    for old in clip_dir.glob("clip_*.mp4"):  # önceki çalıştırmanın klipleri
+    for old in clip_dir.glob("clip_*.*"):  # önceki çalıştırmanın çıktıları
         old.unlink()
+
+    transcriber = None
+    if args.subtitles:
+        t0 = time.perf_counter()
+        model = args.whisper_model or settings.whisper_model
+        transcriber = Transcriber(model)
+        print(f"Altyazı modeli: {model} ({transcriber.device}, {time.perf_counter() - t0:.1f} sn)")
     t0 = time.perf_counter()
 
-    def cut(item: tuple[int, Clip]) -> dict:
+    def make_clip(item: tuple[int, Clip]) -> dict:
         i, c = item
-        out = clip_dir / f"clip_{i:02d}_{hms(c.start).replace(':', '')}.mp4"
-        actual = download_range(job.playlist, c.start, c.end, out, ffmpeg=ffmpeg, encode_args=encode_args)
+        name = f"clip_{i:02d}_{hms(c.start).replace(':', '')}"
+        out = clip_dir / f"{name}.mp4"
+        t = [time.perf_counter()]
+        src = fetch_range(job.playlist, c.start, c.end, clip_dir)
+        t.append(time.perf_counter())
+        try:
+            ass, cues = None, []
+            if transcriber:
+                # Ses, kesilecek aralığın aynısından okunur; zamanlar c.start'a göredir.
+                words = transcriber.transcribe(src.path, job.vod.language, src.offset(c.start), c.duration)
+                cues = build_cues(words)
+                if fmt.layout != "original" and cues:
+                    ass = f"{name}.ass"
+                    (clip_dir / ass).write_text(to_ass(cues, fmt.width, fmt.height, language=job.vod.language), encoding="utf-8")
+            t.append(time.perf_counter())
+            encode_args = None if fmt.layout == "original" else fmt.ffmpeg_args(subtitles=ass)
+            actual = cut(src, c.start, c.end, out, ffmpeg=ffmpeg, encode_args=encode_args)
+            t.append(time.perf_counter())
+            sub = f", altyazı {t[2] - t[1]:4.1f} sn ({len(cues)} satır)" if transcriber else ""
+            print(f"  {name}: indirme {t[1] - t[0]:4.1f} sn{sub}, kodlama {t[3] - t[2]:4.1f} sn")
+            if transcriber:
+                # Kodlamasız kesim anahtar kareye çekildiyse altyazıyı aynı miktar kaydır.
+                (clip_dir / f"{name}.srt").write_text(to_srt(shift(cues, c.start - actual)), encoding="utf-8")
+        finally:
+            src.path.unlink(missing_ok=True)
+        if ass:
+            (clip_dir / ass).unlink(missing_ok=True)  # videoya gömüldü; SRT ayrıca saklanır
         # file_start: klip dosyasının ilk karesinin video zamanı
         return {**c.to_dict(), "file": f"clips/{out.name}", "file_start": round(actual, 3)}
 
     layout = "yatay, kodlamasız" if fmt.layout == "original" else f"{fmt.width}x{fmt.height} {fmt.layout}, {fmt.encoder}"
-    print(f"Klipler hazırlanıyor ({layout})...")
+    print(f"Klipler hazırlanıyor ({layout}{', altyazılı' if transcriber else ''})...")
     # libx264 zaten tüm çekirdekleri kullanır; GPU kodlamada filtreler CPU'da kaldığı için 3 iş iyi dengeler.
-    with ThreadPoolExecutor(max_workers=2 if fmt.encoder == "cpu" and encode_args else 3) as pool:
-        rows = list(pool.map(cut, enumerate(clips, 1)))
+    # Altyazı tanıma GPU'da sıraya alınır; bu sırada diğer klipler indirilip kodlanır.
+    with ThreadPoolExecutor(max_workers=2 if fmt.encoder == "cpu" and fmt.layout != "original" else 3) as pool:
+        rows = list(pool.map(make_clip, enumerate(clips, 1)))
     (job.dir / "clips.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     paths = [job.dir / r["file"] for r in rows]
     size = sum(p.stat().st_size for p in paths) / 2**20
@@ -192,6 +225,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dikey yerleşim: blur (bulanık arka plan, varsayılan), crop (ortadan kesit), original (yatay, kodlamasız)")
     r.add_argument("--encoder", choices=ENCODERS,
                    help="Video kodlayıcı: auto (NVIDIA GPU varsa onu kullanır), nvenc, cpu. Varsayılan: KAC_ENCODER veya auto")
+    r.add_argument("--no-subtitles", dest="subtitles", action="store_false", help="Altyazı üretme")
+    r.add_argument("--whisper-model",
+                   help="faster-whisper modeli (tiny, base, small, medium, large-v3, large-v3-turbo). Varsayılan: KAC_WHISPER_MODEL veya large-v3-turbo")
     r.set_defaults(func=cmd_run)
 
     dt = sub.add_parser("detect", help="Sohbetten anları tespit et (video indirmez)")

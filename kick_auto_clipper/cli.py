@@ -19,6 +19,7 @@ from .config import Settings
 from .detect import Clip, DetectParams, detect
 from .hls import MediaPlaylist, download_range, load_playlist
 from .kick_api import KickError, Vod, get_vod
+from .render import ENCODERS, LAYOUTS, OutputFormat, resolve_encoder
 from .video import download_video, find_ffmpeg
 
 
@@ -70,20 +71,33 @@ def params_from_args(args: argparse.Namespace) -> DetectParams:
         min_rate=args.min_rate,
         pad_before=args.pad,
         pad_after=args.pad,
+        intro=args.intro,
+        outro=args.outro,
+        max_duration=args.max_duration,
         max_clips=args.max_clips,
     )
 
 
 def run_detect(job: Job, args: argparse.Namespace) -> list[Clip]:
     chat = job.ensure_chat(getattr(args, "refresh_chat", False))
-    clips = detect([m["t"] for m in chat], job.playlist.duration or job.vod.duration, params_from_args(args))
+    result = detect(
+        chat, job.playlist.duration or job.vod.duration, params_from_args(args),
+        interruptions=job.playlist.interruptions,
+    )
+    clips = result.clips
     (job.dir / "clips.json").write_text(
         json.dumps([c.to_dict() for c in clips], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     total = sum(c.duration for c in clips)
     print(f"Tespit: {len(clips)} an, toplam {total / 60:.1f} dk (videonun %{100 * total / max(job.vod.duration, 1):.1f}'i)")
     for i, c in enumerate(clips, 1):
-        print(f"  {i:2d}. {hms(c.start)}-{hms(c.end)}  {c.duration:5.0f} sn  zirve {c.peak_rate:6.1f} msj/dk  x{c.score:.1f}")
+        print(f"  {i:2d}. {hms(c.start)}-{hms(c.end)}  {c.duration:3.0f} sn  zirve {c.peak_rate:6.1f} msj/dk  x{c.score:.1f}")
+    if result.rejected:
+        print(f"Elenen: {len(result.rejected)} sıçrama")
+        for r in result.rejected:
+            c = r.clip
+            noise = ", ".join(f"{k} %{v * 100:.0f}" for k, v in c.noise.items())
+            print(f"   - {hms(c.spike_start)}-{hms(c.spike_end)}  x{c.score:.1f}  {r.reason}" + (f"  ({noise})" if noise else ""))
     return clips
 
 
@@ -101,17 +115,25 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     if not clips:
         return 0
 
+    encoder = resolve_encoder(args.encoder or settings.encoder, ffmpeg)
+    fmt = OutputFormat.for_quality(job.playlist.height, args.layout, encoder)
+    encode_args = None if fmt.layout == "original" else fmt.ffmpeg_args()
     clip_dir = job.dir / "clips"
+    for old in clip_dir.glob("clip_*.mp4"):  # önceki çalıştırmanın klipleri
+        old.unlink()
     t0 = time.perf_counter()
 
     def cut(item: tuple[int, Clip]) -> dict:
         i, c = item
         out = clip_dir / f"clip_{i:02d}_{hms(c.start).replace(':', '')}.mp4"
-        actual = download_range(job.playlist, c.start, c.end, out, ffmpeg=ffmpeg)
-        # file_start: klip dosyasının ilk karesinin video zamanı (anahtar kareye hizalı)
+        actual = download_range(job.playlist, c.start, c.end, out, ffmpeg=ffmpeg, encode_args=encode_args)
+        # file_start: klip dosyasının ilk karesinin video zamanı
         return {**c.to_dict(), "file": f"clips/{out.name}", "file_start": round(actual, 3)}
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    layout = "yatay, kodlamasız" if fmt.layout == "original" else f"{fmt.width}x{fmt.height} {fmt.layout}, {fmt.encoder}"
+    print(f"Klipler hazırlanıyor ({layout})...")
+    # libx264 zaten tüm çekirdekleri kullanır; GPU kodlamada filtreler CPU'da kaldığı için 3 iş iyi dengeler.
+    with ThreadPoolExecutor(max_workers=2 if fmt.encoder == "cpu" and encode_args else 3) as pool:
         rows = list(pool.map(cut, enumerate(clips, 1)))
     (job.dir / "clips.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     paths = [job.dir / r["file"] for r in rows]
@@ -157,12 +179,19 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--ratio", type=float, default=d.ratio, help=f"Eşik = ratio x taban (varsayılan {d.ratio})")
         g.add_argument("--min-rate", type=float, default=d.min_rate, help=f"Minimum mesaj/dk (varsayılan {d.min_rate})")
         g.add_argument("--pad", type=float, default=d.pad_before, help=f"Klip öncesi/sonrası dolgu, sn (varsayılan {d.pad_before})")
+        g.add_argument("--intro", type=float, default=d.intro, help=f"Yayının ilk N sn'sindeki sıçramaları yok say (varsayılan {d.intro:.0f})")
+        g.add_argument("--outro", type=float, default=d.outro, help=f"Yayının son N sn'sindeki sıçramaları yok say (varsayılan {d.outro:.0f})")
+        g.add_argument("--max-duration", type=float, default=d.max_duration, help=f"Klip üst sınırı, sn (varsayılan {d.max_duration:.0f}; Shorts/Reels 180, TikTok 600'e kadar izin verir)")
         g.add_argument("--max-clips", type=int, default=d.max_clips, help="En yüksek skorlu N klip (0 = hepsi)")
         g.add_argument("--refresh-chat", action="store_true", help="Sohbeti yeniden indir")
 
     r = sub.add_parser("run", help="Sohbet -> tespit -> yalnızca klip aralıklarını indir")
     common(r)
     detect_opts(r)
+    r.add_argument("--layout", choices=LAYOUTS, default="blur",
+                   help="Dikey yerleşim: blur (bulanık arka plan, varsayılan), crop (ortadan kesit), original (yatay, kodlamasız)")
+    r.add_argument("--encoder", choices=ENCODERS,
+                   help="Video kodlayıcı: auto (NVIDIA GPU varsa onu kullanır), nvenc, cpu. Varsayılan: KAC_ENCODER veya auto")
     r.set_defaults(func=cmd_run)
 
     dt = sub.add_parser("detect", help="Sohbetten anları tespit et (video indirmez)")

@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
-from .kick_api import parse_iso, session
+from .kick_api import KickError, parse_iso, session
 
 
 @dataclass
@@ -44,6 +45,9 @@ class MediaPlaylist:
     height: int
     segments: list[Segment] = field(default_factory=list)
     program_date_time: datetime | None = None  # ilk segmentin duvar saati (UTC)
+    # Yayın kesintileri: (video saniyesi, kayıp süre sn). Kesinti, duvar saatinin
+    # video zaman çizelgesinden ileri sıçramasından veya DISCONTINUITY etiketinden anlaşılır.
+    interruptions: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -92,15 +96,30 @@ def choose_variant(variants: list[Variant], max_height: int) -> Variant:
     return max(pool, key=lambda v: (v.height, v.bandwidth))
 
 
-def parse_media(text: str, url: str, height: int) -> MediaPlaylist:
+def parse_media(text: str, url: str, height: int, gap_tolerance: float = 2.0) -> MediaPlaylist:
     pl = MediaPlaylist(url=url, height=height)
-    t, dur = 0.0, None
+    t, dur, drift = 0.0, None, 0.0
+    discontinuity = False
     for line in text.splitlines():
-        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:") and pl.program_date_time is None:
-            pl.program_date_time = parse_iso(line.split(":", 1)[1].strip())
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            pdt = parse_iso(line.split(":", 1)[1].strip())
+            if pl.program_date_time is None:
+                pl.program_date_time = pdt
+            else:
+                # Duvar saati ile video zamanı arasındaki fark büyüdüyse yayın kesilmiş demektir.
+                new_drift = (pdt - pl.program_date_time).total_seconds() - t
+                if new_drift - drift > gap_tolerance:
+                    pl.interruptions.append((round(t, 3), round(new_drift - drift, 3)))
+                    discontinuity = False
+                drift = new_drift
+        elif line.startswith("#EXT-X-DISCONTINUITY") and not line.startswith("#EXT-X-DISCONTINUITY-"):
+            discontinuity = True
         elif line.startswith("#EXTINF:"):
             dur = float(line[8:].split(",")[0])
         elif line and not line.startswith("#") and dur is not None:
+            if discontinuity and pl.segments:
+                pl.interruptions.append((round(t, 3), 0.0))
+            discontinuity = False
             pl.segments.append(Segment(urljoin(url, line), t, dur))
             t += dur
             dur = None
@@ -112,16 +131,23 @@ def load_playlist(master_url: str, max_height: int) -> MediaPlaylist:
     return parse_media(_get_text(variant.url), variant.url, variant.height)
 
 
-def _fetch(url: str) -> bytes:
-    for attempt in range(5):
+def _fetch(url: str, retries: int = 6) -> bytes:
+    """Segment indirir; ağ hatası ve 5xx/429'da üstel geri çekilmeyle (~1+2+4+8+16 sn) yeniden dener."""
+    delay, last = 1.0, None
+    for attempt in range(retries):
         try:
             r = session().get(url)
             if r.status_code == 200:
                 return r.content
-        except Exception:
-            if attempt == 4:
-                raise
-    raise RuntimeError(f"Segment indirilemedi: {url}")
+            last = f"HTTP {r.status_code}"
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break
+        except Exception as e:  # curl_cffi ağ hataları
+            last = str(e)
+        if attempt < retries - 1:
+            time.sleep(delay)
+            delay *= 2
+    raise KickError(f"Segment indirilemedi ({last}): {url}")
 
 
 def _keyframe_before(ts_path: Path, offset: float, ffprobe: str) -> float:
@@ -147,11 +173,13 @@ def download_range(
     out_path: Path,
     ffmpeg: str = "ffmpeg",
     workers: int = 8,
+    encode_args: list[str] | None = None,
 ) -> float:
-    """[start, end) aralığını (video saniyesi) MP4 olarak kaydeder.
+    """[start, end) aralığını (video saniyesi) MP4 olarak kaydeder, klibin gerçek başlangıcını döner.
 
-    Yeniden kodlama yapılmadığı için kesim, `start` anından önceki son anahtar
-    kareye çekilir (Kick'te ~2 sn arayla). Klibin gerçek başlangıcını döner.
+    `encode_args` verilirse (ör. dikey çıktı) yeniden kodlanır ve kesim kare
+    hassasiyetindedir. Verilmezse yeniden kodlamadan kopyalanır; bu durumda kesim
+    `start` anından önceki son anahtar kareye çekilir (Kick'te ~2 sn arayla).
     """
     segs = pl.segments_between(start, end)
     if not segs:
@@ -165,16 +193,18 @@ def download_range(
             tmp.write(c)
         joined = Path(tmp.name)
     try:
-        ffprobe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
-        offset = _keyframe_before(joined, max(0.0, start - segs[0].start), ffprobe)
+        offset = max(0.0, start - segs[0].start)
+        if encode_args is None:
+            ffprobe = str(Path(ffmpeg).with_name(Path(ffmpeg).name.replace("ffmpeg", "ffprobe")))
+            offset = _keyframe_before(joined, offset, ffprobe)
+            encode_args = ["-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart"]
         actual_start = segs[0].start + offset
         subprocess.run(
             [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{offset:.3f}", "-i", str(joined),
                 "-t", f"{end - actual_start:.3f}",
-                "-c", "copy", "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
+                *encode_args,
                 str(out_path),
             ],
             check=True,

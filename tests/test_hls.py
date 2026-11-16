@@ -46,5 +46,14 @@ class HlsTest(unittest.TestCase):
         self.assertEqual([s.url.rsplit("/", 1)[1] for s in pl.segments_between(20, 21)], ["2.ts"])
 
 
+    def test_interruptions(self):
+        gap = MEDIA.replace("19:30:19.543Z", "19:30:49.543Z")  # 2. segment 30 sn geç başlıyor
+        pl = parse_media(gap, "https://x/480p30/playlist.m3u8", 480)
+        self.assertEqual(pl.interruptions, [(10.0, 30.0)])
+        disc = MEDIA.replace("#EXTINF:3.334,", "#EXT-X-DISCONTINUITY\n#EXTINF:3.334,")
+        self.assertEqual(parse_media(disc, "https://x/p.m3u8", 480).interruptions, [(20.0, 0.0)])
+        self.assertEqual(parse_media(MEDIA, "https://x/p.m3u8", 480).interruptions, [])
+
+
 if __name__ == "__main__":
     unittest.main()

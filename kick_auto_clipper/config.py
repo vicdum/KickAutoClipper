@@ -27,6 +27,7 @@ class Settings:
     quality: int
     workdir: Path
     chat_workers: int
+    encoder: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,4 +36,5 @@ class Settings:
             quality=int(os.environ.get("KAC_QUALITY", DEFAULT_QUALITY)),
             workdir=Path(os.environ.get("KAC_WORKDIR", "workspace")),
             chat_workers=int(os.environ.get("KAC_CHAT_WORKERS", 16)),
+            encoder=os.environ.get("KAC_ENCODER", "auto"),
         )

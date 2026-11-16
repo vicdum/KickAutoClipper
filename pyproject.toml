@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kick-auto-clipper"
+version = "0.1.0"
+description = "Kick yayınlarındaki viral anları sohbet yoğunluğundan bulup otomatik klip üretir."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["curl_cffi>=0.7", "yt-dlp>=2025.1.1"]
+
+[project.scripts]
+kac = "kick_auto_clipper.cli:main"
+
+[tool.setuptools]
+packages = ["kick_auto_clipper"]

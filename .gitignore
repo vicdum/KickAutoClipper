@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Yerel ayarlar
+.env
+
+# Test / çalışma alanları (indirilen yayınlar, sohbetler, klipler)
+workspace/
+downloads/
+*.mp4
+*.ts
+*.part
+*.ytdl
+*.srt
+*.vtt

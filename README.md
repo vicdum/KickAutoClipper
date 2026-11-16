@@ -104,8 +104,10 @@ Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bı
 `kac detect` elenen sıçramaları gerekçesiyle listeler:
 
 ```
-Elenen: 1 sıçrama
-   - 00:57:07-00:58:28  x4.8  kapanış  (farewell %8)
+Elenen: 3 sıçrama
+   - 00:00:30-00:01:01  x3.8  açılış
+   - 02:58:41-02:58:49  x3.4  az kullanıcı (2)
+   - 02:59:42-03:00:33  x6.1  çekiliş anahtar kelimesi (annenpala)
 ```
 
 Çıktılar `workspace/<kanal>/<vod-uuid>/` altına yazılır:
@@ -142,8 +144,21 @@ Elenen: 1 sıçrama
 - **Gürültü mesajları:** Her mesaj içeriğine göre sınıflandırılır (`noise.py`): selamlaşma (sa, selam, hg…), vedalaşma (bb, görüşürüz, iyi geceler, kapatma, bye emote'ları…), kesinti tepkisi (drop, f5, yayın gitti, geri geldi, ses yok…) ve bot komutları (`!komut`, bot hesapları). Yalnızca kısa mesajlar (≤6 kelime) gürültü sayılır; Türkçe karakter dönüşümünde karışan kelimeler (dondu/döndü) yalnızca tek başına yazıldığında sayılır.
 - **Tespit:** Gürültü mesajları hariç, her kullanıcı 5 sn'de en fazla bir kez sayılarak (spam koruması) 30 sn'lik ortalanmış pencerede mesaj/dk oranı hesaplanır.
   - **Taban çizgisi iki ölçeklidir.** Yerel taban (10 dk kayan medyan) içeriğe göre değişen izleyici sayısını izler; genel taban (tüm yayının medyanı) yerel tabanın aşırı kaymasını sınırlar. Etkin taban ikisinin geometrik ortalamasıdır: yerel taban genelin 4 katına çıkarsa etkin taban 2 katında kalır. Böylece kalabalık bir bölümde gerçek sıçramalar kaybolmaz, sakin bir bölümde küçük dalgalanmalar sıçrama sayılmaz.
-  - Oranın `max(2 × etkin taban, 10)` eşiğini aştığı bölgeler aday sıçramadır. 10 sn'den yakın adaylar birleştirilir, 5 sn'den kısalar atlanır.
-  - **Eleme:** açılış ve kapanıştaki ilk/son 2 dk, oynatma listesinde görülen bir yayın kesintisinden sonraki 90 sn, mesajlarının %30'undan fazlası gürültü ya da %10'undan fazlası kesinti tepkisi olan sıçramalar.
+  - Oranın `max(2 × etkin taban, 10, anlamlılık eşiği)` değerini aştığı bölgeler aday sıçramadır. 10 sn'den yakın adaylar birleştirilir, 5 sn'den kısalar atlanır.
+  - **İstatistiksel anlamlılık:** Sessiz sohbetlerde (dakikada birkaç mesaj) 30 sn'lik pencerede 2-3 mesaj beklenir ve 6 mesaj tesadüfen sıkça görülür. Anlamlılık eşiği, tabanın Poisson dağılımında tesadüfen üretme olasılığı 1/10.000'in altında kalan en düşük orandır: dakikada 5 mesajlık tabanda 4,4 kat, 50 mesajda 1,9 kat, 200 mesajda 1,4 kat. Kalabalık sohbette `2 × taban` kuralı zaten daha katı olduğu için yalnızca sessiz sohbetleri etkiler.
+  - **Eleme:** açılış ve kapanıştaki ilk/son 2 dk, oynatma listesinde görülen bir yayın kesintisinden sonraki 90 sn, mesajlarının %30'undan fazlası gürültü ya da %10'undan fazlası kesinti tepkisi olan sıçramalar ve zirvesini 5'ten az kişinin oluşturduğu sıçramalar.
+  - **Çekilişler:** Çekilişte bir anahtar kelime duyurulur, izleyiciler katılmak için onu yazar; ardından sonuçlara tepki verilir ("şike", "tüh çıkmadı"). Bunlar viral an değildir. Üç kural:
+    1. *Katılım akını:* mesajların %40'ından fazlası en az 8 kişinin tek başına yazdığı aynı kelimeyse (ör. "palavip") ve son 20 dk'da çekilişten bahsedildiyse. Doğal tepki kelimeleri ("gg", "şike", "faul"…) sayılmaz; çekiliş anılmamışsa toplu tek kelime gerçek tepki kabul edilir.
+    2. *Çekiliş oturumu:* katılım akınlarının 15 dk öncesinden 5 dk sonrasına kadar olan bölüm (30 dk'dan yakın akınlar aynı oturum).
+    3. *Çekiliş anı:* sıçramadan 2 dk önce ile sıçrama sonu arasında en az 3 farklı kişi (bot duyuruları dahil, komut listeleri hariç) çekilişten bahsediyorsa.
+
+  Üç farklı yayında doğrulandı:
+
+  | Yayın | Sohbet | Bulunan | Elenen | Not |
+  | --- | --- | --- | --- | --- |
+  | muratabigf, 58 dk, bilardo | ~68 msj/dk | 10 | 1 (kapanış) | Kurallar eklenmeden önceki 10 anla aynı |
+  | palababayigit, 7,8 sa, oyun + çekiliş | ~13 msj/dk | 0 | 23 | Önce 64 an çıkıyordu; ekran görüntüleriyle hepsinin çekiliş ekranı, geri sayım ya da sohbet dalgalanması olduğu doğrulandı |
+  | jahrein, 4,2 sa, sohbet | ~230 msj/dk | 26 | 0 | Gülme (KEKW), korku tepkileri, gündem; yeni kurallar hiçbir anı elemedi |
 - **Yayın kesintisi:** Oynatma listesinde `#EXT-X-PROGRAM-DATE-TIME` duvar saati video zamanından 2 sn'den fazla ileri sıçrarsa ya da `#EXT-X-DISCONTINUITY` varsa kesinti sayılır. Kick bağlantı kopunca çoğunlukla yeni bir VOD başlattığı için, bu tür kesintiler genelde VOD başındaki tepki olarak görülür ve açılış kuralı ile gürültü filtresi tarafından yakalanır.
 - **Klip indirme:** Kick VOD'ları ~10 sn'lik MPEG-TS segmentlerinden oluşur. Her klip için yalnızca ilgili segmentler paralel indirilir, birleştirilir ve FFmpeg ile kare hassasiyetinde kesilip dikey formata kodlanır.
 - Kick Cloudflare arkasında olduğu için istekler `curl_cffi` ile tarayıcı parmak izi taklit edilerek gönderilir.

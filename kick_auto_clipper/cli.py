@@ -22,7 +22,7 @@ from .hls import MediaPlaylist, cut, fetch_range, load_playlist
 from .kick_api import KickError, Vod, get_vod
 from .render import ENCODERS, LAYOUTS, OutputFormat, resolve_encoder
 from . import speech
-from .subtitles import Transcriber, build_cues, load_stereo, shift, to_ass, to_srt, write_wav
+from .subtitles import Transcriber, load_stereo, shift, to_ass, to_srt, write_wav
 
 CONTEXT = 15.0  # altyazı tanımada klipten önce modele verilen bağlam (sn)
 from .video import download_video, find_ffmpeg
@@ -131,8 +131,7 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         t0 = time.perf_counter()
         model = args.whisper_model or settings.whisper_model
         transcriber = Transcriber(model)
-        print(f"Altyazı modeli: {model} ({transcriber.device}, {time.perf_counter() - t0:.1f} sn)"
-              + ("" if speech.available() else " — PyTorch yok: kelime zamanları hizalanmayacak"))
+        print(f"Altyazı modeli: {model} ({transcriber.device}, {time.perf_counter() - t0:.1f} sn)")
     boost = args.voice_boost and fmt.layout != "original"
     if boost and not speech.available():
         print("Konuşma güçlendirme için PyTorch gerekli (pip install -e \".[gpu]\"); atlanıyor.")
@@ -151,8 +150,8 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         try:
             if transcriber:
                 # Ses, kesilecek aralığın aynısından okunur; zamanlar c.start'a göredir.
-                words = transcriber.transcribe(src.path, job.vod.language, src.offset(c.start), c.duration, context=CONTEXT)
-                cues = build_cues(words)
+                cues = transcriber.cues(src.path, job.vod.language, src.offset(c.start), c.duration,
+                                       context=CONTEXT, refine=args.refine_timing)
                 if fmt.layout != "original" and cues:
                     ass = f"{name}.ass"
                     (clip_dir / ass).write_text(to_ass(cues, fmt.width, fmt.height, language=job.vod.language), encoding="utf-8")
@@ -248,6 +247,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--encoder", choices=ENCODERS,
                    help="Video kodlayıcı: auto (NVIDIA GPU varsa onu kullanır), nvenc, cpu. Varsayılan: KAC_ENCODER veya auto")
     r.add_argument("--no-subtitles", dest="subtitles", action="store_false", help="Altyazı üretme")
+    r.add_argument("--refine-timing", action="store_true",
+                   help="Kayan altyazı satırlarını tekrar dinleyerek düzelt (daha doğru senkron, ~4-5 kat yavaş altyazı)")
     r.add_argument("--no-voice-boost", dest="voice_boost", action="store_false",
                    help="Konuşmayı öne çıkarma (vokal ayrıştırıp arka planı kısma) adımını atla")
     r.add_argument("--whisper-model",

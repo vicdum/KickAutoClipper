@@ -17,11 +17,11 @@ Gereksinimler: Python 3.10+, [FFmpeg](https://ffmpeg.org/) (PATH'te olmalı; Win
 python -m venv .venv
 .venv/Scripts/activate        # Linux/macOS: source .venv/bin/activate
 pip install -e ".[gpu]"      # NVIDIA GPU yoksa: pip install -e .
-# Kelime hizalama ve konuşma güçlendirme için PyTorch (NVIDIA GPU, CUDA 12.8):
+# Konuşma güçlendirme için PyTorch (NVIDIA GPU, CUDA 12.8):
 pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-`[gpu]` eki altyazı üretimi için CUDA kütüphanelerini (cuBLAS, cuDNN) kurar. PyTorch kurulu değilse altyazılar yine üretilir, ancak kelime zamanları hizalanmaz ve konuşma güçlendirme atlanır. GPU olmayan makinede PyTorch'un CPU sürümü kurulabilir (`pip install torch torchaudio`). İlk çalıştırmada modeller bir kez indirilir: Whisper large-v3 (~3 GB), hizalama (~1,2 GB), vokal ayrıştırma (~320 MB).
+`[gpu]` eki altyazı üretimi için CUDA kütüphanelerini (cuBLAS, cuDNN) kurar. PyTorch kurulu değilse konuşma güçlendirme atlanır; altyazılar etkilenmez. GPU olmayan makinede PyTorch'un CPU sürümü kurulabilir (`pip install torch torchaudio`). İlk çalıştırmada modeller bir kez indirilir: Whisper large-v3 (~3 GB), vokal ayrıştırma (~320 MB).
 
 ## Kullanım
 
@@ -51,7 +51,17 @@ kac run https://kick.com/<kanal>/videos/<uuid>
 
 - **Konuşma tanıma:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper), varsayılan model `large-v3`, dil VOD bilgisinden (ör. `tr`). NVIDIA GPU varsa CUDA (float16), yoksa CPU (int8) kullanılır. Türkçede `large-v3`, `large-v3-turbo`'dan belirgin daha doğru; turbo'da tekrar döngüleri ve uydurma cümleler görüldü.
 - **Bağlam:** Klipten önceki 15 sn de modele verilir (sonuçtan çıkarılır). Klip çoğu zaman bir cümlenin ortasında başladığı için bu, karşılaştırmada en büyük doğruluk artışını sağladı (medyan kelime güveni 0,79 → 0,91).
-- **Zaman hizalama:** Whisper'ın kelime zaman damgaları gürültülü seste 1-2 sn (yer yer daha fazla) kayıyor. Tanınan metin, her Whisper segmentinin kendi penceresinde [MMS](https://pytorch.org/audio/stable/pipelines.html#id60) zorlamalı hizalama modeliyle (torchaudio `MMS_FA`) sese yeniden hizalanır; zamanlar sıralı tutulur. Doğrulama: altyazı yapay olarak ±0,5–1,5 sn kaydırıldığında konuşma başlangıçlarıyla uyum her klipte düşüyor, en iyi uyum 0 kaymada.
+- **Zamanlama:** Kelime zamanları Whisper'ın kendisinden gelir. Senkron, bağımsız bir "tekrar dinleme" testiyle ölçüldü: her altyazı satırının aralığı başka bir modele (large-v3-turbo) tek başına dinletilir ve duyulan metin satırla karşılaştırılır (1 sn yapay kaydırma uyumu 0,61'den 0,22'ye düşürüyor, yani test kaymayı yakalıyor).
+
+  | Yöntem | Uyum | Zayıf satır |
+  | --- | --- | --- |
+  | **Whisper zamanları (kullanılan)** | **0,61** | **%27** |
+  | Zorlamalı hizalama (MMS), tüm klip | 0,56 | %35 |
+  | Zorlamalı hizalama (MMS), segment pencereli | 0,41 | %58 |
+
+  Zorlamalı hizalama Türkçe gürültülü yayın sesinde zamanları iyileştirmek yerine bozduğu için kullanılmıyor. VAD sessizlik eşiği (500 ms / 2000 ms / VAD yok) da sonucu değiştirmiyor.
+- **Uzun kelimeler:** Whisper kelimelerin ~%5'ine 1-5 sn süre veriyor (kelime yanındaki duraklamayı yutuyor). Bağımsız dinlemeyle ölçüldü: cümle içi kelimelerde konuşma aralığın sonunda, cümlenin ilk kelimesinde başında. Bu kelimeler doğal uzunluğa (~0,35 sn + harf başına 0,09 sn) bu yöne göre kırpılır; böylece satır duraklamada bölünür ve sonraki kelimeler söylenmeden ekrana gelmez. (Kelimelerin yalnızca ~%5'ine dokunduğu için tüm satırlar üzerinden yapılan ölçümde belirgin fark görülmedi.)
+- **İsteğe bağlı düzeltme (`--refine-timing`):** Her satır tek başına yeniden dinlenir, metinle uyuşmuyorsa ±1,5 sn içinde en iyi uyduğu konuma kaydırılır. Bağımsız ölçümde kayan satır oranı %8 → %6, ancak altyazı süresi ~4-5 kat uzuyor; bu yüzden varsayılan olarak kapalı.
 - **Görünüm:** Kısa video stili; en fazla 3 kelime / 22 karakterlik parçalar, büyük kalın beyaz yazı, siyah kenar çizgisi, konuşulan kelime sarı. Yazı, `blur` yerleşiminde görüntünün hemen altındaki bulanık alanda durur. Türkçe büyük harf kuralı (i → İ) uygulanır.
 - **Doğruluk önlemleri:** Sessizlik yalnızca ses etkinliği algılama (VAD) ile belirlenir; Whisper'ın kendi "konuşma yok" kararı kapalıdır, çünkü gürültülü ortamda konuşma olan 30 sn'lik pencerenin tamamını atabiliyor. Önceki metne koşullama kapalıdır (tekrar döngülerini önler). Whisper'ın sessizlikte uydurduğu bilinen kalıplar ("Altyazı M.K.", "abone olmayı unutmayın"…) elenir, parçalı gelen kelimeler birleştirilir ("Enes" + "'in"), noktalama olmasa da cümle sınırında yeni satıra geçilir. Rastgele tohum sabittir.
 - **Denenip vazgeçilenler:** Sohbet/başlık kelimeleriyle ipucu (doğruluğu düşürdü, ipucu kelimeleri metne sızdı), ses filtresi (bağlamla birlikte fark yaratmadı), vokal ayrıştırılmış seste tanıma (güven düştü, uydurma arttı), toplu (batched) çıkarım (2 kat hızlı ama kelimelerin ~%30'unu kaçırdı).
@@ -88,6 +98,7 @@ Uzun bir sıçrama süre sınırını aşarsa klip, öncesinde 15 sn bağlam bı
 | `--whisper-model` | `large-v3` | Altyazı modeli (yalnızca `run`) |
 | `--no-subtitles` | | Altyazı üretme (yalnızca `run`) |
 | `--no-voice-boost` | | Konuşma güçlendirmeyi atla (yalnızca `run`) |
+| `--refine-timing` | | Kayan altyazı satırlarını tekrar dinleyerek düzelt (yavaş; yalnızca `run`) |
 | `--refresh-chat` | | Önbellekteki sohbeti yeniden indir |
 
 `kac detect` elenen sıçramaları gerekçesiyle listeler:

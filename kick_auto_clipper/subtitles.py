@@ -1,8 +1,8 @@
 """Konuşmayı yazıya döker ve kısa video platformlarına uygun altyazı üretir.
 
 - Konuşma tanıma: faster-whisper (CTranslate2). NVIDIA GPU varsa CUDA, yoksa CPU (int8).
-  Klipten önceki 15 sn bağlam olarak verilir; kelime zamanları zorlamalı hizalamayla
-  düzeltilir (bkz. `speech.py`).
+  Klipten önceki 15 sn bağlam olarak verilir. Kelime zamanları Whisper'ın kendisinden
+  gelir (zorlamalı hizalama denendi, daha kötü çıktı; bkz. `speech.py`).
 - Kelime düzeyinde zaman damgaları ile kısa (en fazla birkaç kelimelik) altyazı
   parçaları oluşturulur; konuşulan kelime renkle vurgulanır (Shorts/TikTok stili).
 - Çıktılar: videoya gömülecek ASS dosyası ve ayrıca yüklenebilecek SRT dosyası.
@@ -17,8 +17,6 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-
-from . import speech as _speech
 
 # Türkçe dahil İngilizce dışı dillerde large-v3, turbo sürümünden belirgin daha doğru
 # (turbo'da kod çözücü katmanları 32'den 4'e indirilmiştir).
@@ -104,15 +102,16 @@ class Transcriber:
         start: float = 0.0,
         duration: float | None = None,
         context: float = 15.0,
-        align: bool = True,
     ) -> list[Word]:
-        """`media` dosyasının [start, start+duration] aralığını yazıya döker; zamanlar `start`'a göredir.
+        return self._transcribe(media, language, start, duration, context)[0]
+
+    def _transcribe(self, media, language, start, duration, context):
+        """`media` dosyasının [start, start+duration] aralığını yazıya döker; (kelimeler, ses, bağlam süresi)
+        döner, zamanlar `start`'a göredir.
 
         - `context`: aralıktan önceki bu kadar saniye de modele verilir. Klip bir cümlenin
           ortasında başlayabildiği için bağlam tanıma doğruluğunu belirgin artırır; bu
           bölümdeki kelimeler sonuçtan çıkarılır.
-        - `align`: PyTorch kuruluysa kelime zamanları zorlamalı hizalamayla düzeltilir
-          (Whisper'ın 1-2 sn'lik kaymalarını giderir).
         """
         ctx_start = max(0.0, start - context)
         pre = start - ctx_start
@@ -126,9 +125,8 @@ class Transcriber:
             result, _ = self.model.transcribe(
                 audio,
                 language=language,
-                # Kelime zamanları hizalamada düzeltilse de kapatılmamalı: Whisper bir sonraki
-                # 30 sn'lik pencereye nereden devam edeceğini bunlarla belirler; kapalıyken
-                # pencereler atlanıp metnin bir kısmı kaybolabiliyor.
+                # Kelime zamanları altyazı senkronu için kullanılır; ayrıca Whisper bir sonraki
+                # 30 sn'lik pencereye nereden devam edeceğini bunlarla belirler.
                 word_timestamps=True,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500},
@@ -144,16 +142,134 @@ class Transcriber:
             segments = [_merge_pieces(s) for s in result if not _HALLUCINATIONS.search(s.text)]
         segments = [s for s in segments if s[2]]
 
-        if align and _speech.available():
-            timed = _speech.align_segments(audio, segments)
-            segments = [(s0, s1, [(a, b, w[2]) for (a, b), w in zip(t, ws)]) for (s0, s1, ws), t in zip(segments, timed)]
-
         words = []
         for _, _, ws in segments:
             for k, (a, b, text) in enumerate(ws):
                 if b - pre > 0.05:  # bağlam bölümündeki kelimeleri at
                     words.append(Word(round(max(a - pre, 0.0), 3), round(b - pre, 3), text, k == len(ws) - 1))
-        return words
+        return fix_long_words(words), audio, pre
+
+    def cues(
+        self,
+        media: Path,
+        language: str | None = None,
+        start: float = 0.0,
+        duration: float | None = None,
+        context: float = 15.0,
+        refine: bool = False,
+    ) -> list[Cue]:
+        """Yazıya döküp altyazı satırlarına böler. `refine`: kayan satırları tekrar dinleyerek
+        düzeltir (bağımsız ölçümde kayan satır oranı %8 -> %6, ancak ~4-5 kat yavaş)."""
+        words, audio, pre = self._transcribe(media, language, start, duration, context)
+        cues = build_cues(words)
+        if refine and cues:
+            cues = self.refine_timing(audio, pre, cues, language)
+        return cues
+
+    # --- tekrar dinleyerek zaman düzeltme -----------------------------------
+
+    def listen(self, audio, start: float, end: float, language: str | None) -> str:
+        """[start, end] aralığını tek başına yazıya döker (zaman damgasız, hızlı)."""
+        lo, hi = max(0, int((start - 0.15) * 16000)), min(len(audio), int((end + 0.15) * 16000))
+        if hi - lo < 3200:  # 0.2 sn'den kısa
+            return ""
+        with self._lock:
+            segs, _ = self.model.transcribe(
+                audio[lo:hi], language=language, beam_size=1, vad_filter=False,
+                condition_on_previous_text=False, without_timestamps=True,
+            )
+            text = " ".join(s.text for s in segs)
+        return "" if _HALLUCINATIONS.search(text) else text
+
+    def refine_timing(self, audio, pre: float, cues: list[Cue], language: str | None) -> list[Cue]:
+        """Whisper'ın kelime zamanları satırların ~%10'unda 0,5-1,5 sn kayıyor. Her satırın
+        aralığı tek başına yeniden dinlenir; duyulan metin satırla uyuşmuyorsa satır
+        -1,5..+1,5 sn kaydırılarak en iyi uyduğu konum aranır. Kayma yalnızca belirgin
+        iyileşmede uygulanır; satırlar komşularıyla çakışmaz."""
+        out = []
+        for c in cues:
+            a, b = c.start + pre, c.end + pre
+            base = text_similarity(c.text, self.listen(audio, a, b, language))
+            shift = 0.0
+            if base < REFINE_WEAK and len(c.text) >= 4:
+                best, best_d = base, 0.0
+                for d in REFINE_SHIFTS:
+                    s = text_similarity(c.text, self.listen(audio, a + d, b + d, language))
+                    if s > best:
+                        best, best_d = s, d
+                if best >= REFINE_ACCEPT and best - base >= REFINE_GAIN:
+                    shift = best_d
+            out.append(shift_cue(c, shift) if shift else c)
+        return no_overlap(out)
+
+
+REFINE_WEAK = 0.5  # bu benzerliğin altındaki satırlar için kayma aranır
+REFINE_ACCEPT = 0.6  # kaydırılmış konumda en az bu benzerlik gerekir
+REFINE_GAIN = 0.3  # ve mevcut konumdan en az bu kadar iyi olmalı
+REFINE_SHIFTS = (-1.5, -1.0, -0.5, 0.5, 1.0, 1.5)
+
+
+def text_similarity(a: str, b: str) -> float:
+    """Normalize edilmiş (küçük harf, Türkçe karakter dönüşümlü, boşluksuz) metinlerin benzerliği."""
+    from difflib import SequenceMatcher
+
+    from .noise import normalize
+
+    a, b = normalize(a).replace(" ", ""), normalize(b).replace(" ", "")
+    return SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def normalize_words(text: str) -> list[str]:
+    from .noise import normalize
+
+    return normalize(text).split()
+
+
+def shift_cue(c: Cue, d: float) -> Cue:
+    return Cue(max(c.start + d, 0.0), c.end + d,
+               [Word(max(w.start + d, 0.0), w.end + d, w.text, w.sentence_end) for w in c.words])
+
+
+def no_overlap(cues: list[Cue]) -> list[Cue]:
+    """Sıralar ve çakışmaları giderir: kaydırılan satır komşusunun üstüne binerse kırpılır."""
+    cues = sorted(cues, key=lambda c: c.start)
+    for prev, cur in zip(cues, cues[1:]):
+        if cur.start < prev.end:
+            prev.end = max(prev.start, cur.start)
+            for w in prev.words:
+                w.end = min(w.end, prev.end)
+                w.start = min(w.start, w.end)
+    return cues
+
+
+def natural_duration(text: str) -> float:
+    """Bir kelimenin konuşulması için makul üst süre (~11 harf/sn + pay)."""
+    return 0.35 + 0.09 * len(text)
+
+
+def fix_long_words(words: list[Word], tolerance: float = 1.0) -> list[Word]:
+    """Whisper'ın duraklamaya yayılmış kelime zamanlarını kırpar.
+
+    Whisper bazı kelimelere 2-5 sn süre veriyor (ör. 'analar' 4,6 sn). 3 kelimelik satır
+    ekranda birlikte durduğu için bu, sonraki kelimelerin henüz söylenmeden görünmesine
+    ("altyazı önden gidiyor") yol açar. Bağımsız bir modelle dinleyerek ölçüldü:
+    - cümle ortası/sonu kelimelerde konuşma aralığın SONUNDA (10'a 1): kelime, önündeki
+      duraklamayı yutuyor -> bitiş korunur, başlangıç ileri çekilir;
+    - cümlenin ilk kelimesinde konuşma aralığın BAŞINDA (4'e 1): kelime ardındaki
+      sessizliğe yayılıyor -> başlangıç korunur, bitiş geri çekilir.
+    Kırpma, satır bölmenin (uzun duraklamada yeni satır) doğru yerde yapılmasını da sağlar.
+    """
+    out, first = [], True
+    for w in words:
+        limit = natural_duration(w.text)
+        if w.end - w.start > max(limit, tolerance):
+            if first:
+                w = Word(w.start, round(w.start + limit, 3), w.text, w.sentence_end)
+            else:
+                w = Word(round(w.end - limit, 3), w.end, w.text, w.sentence_end)
+        out.append(w)
+        first = w.sentence_end
+    return out
 
 
 def _merge_pieces(seg) -> tuple[float, float, list[tuple[float, float, str]]]:
